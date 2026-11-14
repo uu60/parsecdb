@@ -37,9 +37,10 @@ BoolOperator::BoolOperator(int64_t x, int64_t y, int l, int taskTag, int msgTagO
         _yi = ring(y);
     } else {
         if (Comm::rank() == clientRank) {
-            int64_t x1 = 1;
+            // Server 1's shares must be uniformly random, otherwise server 0 learns the inputs from its own shares.
+            int64_t x1 = ring(Math::randBits());
             int64_t x0 = ring(x ^ x1);
-            int64_t y1 = 1;
+            int64_t y1 = ring(Math::randBits());
             int64_t y0 = ring(y ^ y1);
             std::vector xy0 = {x0, y0};
             std::vector xy1 = {x1, y1};

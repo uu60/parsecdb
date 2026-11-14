@@ -1,113 +1,16 @@
-//
-// #include "utils/Crypto.h"
-// #include <openssl/rsa.h>
-// #include <openssl/pem.h>
-// #include <vector>
-// #include <string>
-//
-// std::unordered_map<int, std::string> Crypto::_selfPubs = {};
-// std::unordered_map<int, std::string> Crypto::_selfPris = {};
-// std::unordered_map<int, std::string> Crypto::_otherPubs = {};
-//
-// bool Crypto::generateRsaKeys(int bits) {
-//     if (_selfPubs.count(bits) > 0) {
-//         return false;
-//     }
-//
-//     EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, nullptr);
-//     EVP_PKEY *pkey = nullptr;
-//     EVP_PKEY_keygen_init(ctx);
-//     EVP_PKEY_CTX_set_rsa_keygen_bits(ctx, bits);
-//     EVP_PKEY_keygen(ctx, &pkey);
-//
-//     BIO *pri = BIO_new(BIO_s_mem());
-//     BIO *pub = BIO_new(BIO_s_mem());
-//
-//     PEM_write_bio_PrivateKey(pri, pkey, nullptr, nullptr, 0, nullptr, nullptr);
-//     PEM_write_bio_PUBKEY(pub, pkey);
-//
-//     size_t pri_len = BIO_pending(pri);
-//     size_t pub_len = BIO_pending(pub);
-//
-//     char *pri_key = (char *)malloc(pri_len + 1);
-//     char *pub_key = (char *)malloc(pub_len + 1);
-//
-//     BIO_read(pri, pri_key, pri_len);
-//     BIO_read(pub, pub_key, pub_len);
-//
-//     pri_key[pri_len] = '\0';
-//     pub_key[pub_len] = '\0';
-//
-//     _selfPubs[bits] = std::string(pub_key);
-//     _selfPris[bits] = std::string(pri_key);
-//     EVP_PKEY_free(pkey);
-//     BIO_free_all(pub);
-//     BIO_free_all(pri);
-//     free(pri_key);
-//     free(pub_key);
-//
-//     return true;
-// }
-//
-// std::string Crypto::rsaEncrypt(const std::string &data, const std::string &publicKey) {
-//     EVP_PKEY *pkey = nullptr;
-//     EVP_PKEY_CTX *ctx = nullptr;
-//     BIO *keybio = BIO_new_mem_buf((void *)publicKey.c_str(), -1);
-//     pkey = PEM_read_bio_PUBKEY(keybio, nullptr, nullptr, nullptr);
-//     ctx = EVP_PKEY_CTX_new(pkey, nullptr);
-//     EVP_PKEY_encrypt_init(ctx);
-//
-//     size_t outlen;
-//     EVP_PKEY_encrypt(ctx, nullptr, &outlen, (unsigned char *)data.c_str(), data.size());
-//     std::vector<unsigned char> outbuf(outlen);
-//     EVP_PKEY_encrypt(ctx, outbuf.data(), &outlen, (unsigned char *)data.c_str(), data.size());
-//
-//     EVP_PKEY_CTX_free(ctx);
-//     EVP_PKEY_free(pkey);
-//     BIO_free(keybio);
-//     return std::string(outbuf.begin(), outbuf.end());
-// }
-//
-// std::string Crypto::rsaDecrypt(const std::string &encryptedData, const std::string &privateKey) {
-//     EVP_PKEY *pkey = nullptr;
-//     EVP_PKEY_CTX *ctx = nullptr;
-//     BIO *keybio = BIO_new_mem_buf((void *)privateKey.c_str(), -1);
-//     pkey = PEM_read_bio_PrivateKey(keybio, nullptr, nullptr, nullptr);
-//     ctx = EVP_PKEY_CTX_new(pkey, nullptr);
-//     EVP_PKEY_decrypt_init(ctx);
-//
-//     size_t outlen;
-//     EVP_PKEY_decrypt(ctx, nullptr, &outlen, (unsigned char *)encryptedData.c_str(), encryptedData.size());
-//     std::string decryptedStr(outlen, '\0');
-//     EVP_PKEY_decrypt(ctx, (unsigned char *)decryptedStr.data(), &outlen, (unsigned char *)encryptedData.c_str(),
-//     encryptedData.size()); decryptedStr.resize(outlen);
-//
-//     EVP_PKEY_CTX_free(ctx);
-//     EVP_PKEY_free(pkey);
-//     BIO_free(keybio);
-//     return decryptedStr;
-// }
-//
-//
-
 #include "parsecdb/utils/Crypto.h"
+#include <algorithm>
 #include <cstring>
 #include <functional>
 #include <memory>
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
-#include <openssl/pem.h>
-#include <openssl/rsa.h>
 #include <openssl/sha.h>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace parsecdb {
-
-std::unordered_map<int, std::string> Crypto::_selfPubs = {};
-std::unordered_map<int, std::string> Crypto::_selfPris = {};
-std::unordered_map<int, std::string> Crypto::_otherPubs = {};
 
 static inline void store_u64_le(uint64_t x, unsigned char out[8]) {
     out[0] = (unsigned char)(x);
@@ -118,86 +21,6 @@ static inline void store_u64_le(uint64_t x, unsigned char out[8]) {
     out[5] = (unsigned char)(x >> 40);
     out[6] = (unsigned char)(x >> 48);
     out[7] = (unsigned char)(x >> 56);
-}
-
-bool Crypto::generateRsaKeys(int bits) {
-    if (_selfPubs.count(bits) > 0) {
-        return false;
-    }
-
-    EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, nullptr);
-    EVP_PKEY* pkey = nullptr;
-    EVP_PKEY_keygen_init(ctx);
-    EVP_PKEY_CTX_set_rsa_keygen_bits(ctx, bits);
-    EVP_PKEY_keygen(ctx, &pkey);
-
-    BIO* pri = BIO_new(BIO_s_mem());
-    BIO* pub = BIO_new(BIO_s_mem());
-
-    PEM_write_bio_PrivateKey(pri, pkey, nullptr, nullptr, 0, nullptr, nullptr);
-    PEM_write_bio_PUBKEY(pub, pkey);
-
-    size_t pri_len = BIO_pending(pri);
-    size_t pub_len = BIO_pending(pub);
-
-    char* pri_key = (char*)malloc(pri_len + 1);
-    char* pub_key = (char*)malloc(pub_len + 1);
-
-    BIO_read(pri, pri_key, pri_len);
-    BIO_read(pub, pub_key, pub_len);
-
-    pri_key[pri_len] = '\0';
-    pub_key[pub_len] = '\0';
-
-    _selfPubs[bits] = std::string(pub_key);
-    _selfPris[bits] = std::string(pri_key);
-    EVP_PKEY_free(pkey);
-    BIO_free_all(pub);
-    BIO_free_all(pri);
-    free(pri_key);
-    free(pub_key);
-
-    return true;
-}
-
-std::string Crypto::rsaEncrypt(const std::string& data, const std::string& publicKey) {
-    EVP_PKEY* pkey = nullptr;
-    EVP_PKEY_CTX* ctx = nullptr;
-    BIO* keybio = BIO_new_mem_buf((void*)publicKey.c_str(), -1);
-    pkey = PEM_read_bio_PUBKEY(keybio, nullptr, nullptr, nullptr);
-    ctx = EVP_PKEY_CTX_new(pkey, nullptr);
-    EVP_PKEY_encrypt_init(ctx);
-
-    size_t outlen;
-    EVP_PKEY_encrypt(ctx, nullptr, &outlen, (unsigned char*)data.c_str(), data.size());
-    std::vector<unsigned char> outbuf(outlen);
-    EVP_PKEY_encrypt(ctx, outbuf.data(), &outlen, (unsigned char*)data.c_str(), data.size());
-
-    EVP_PKEY_CTX_free(ctx);
-    EVP_PKEY_free(pkey);
-    BIO_free(keybio);
-    return std::string(outbuf.begin(), outbuf.end());
-}
-
-std::string Crypto::rsaDecrypt(const std::string& encryptedData, const std::string& privateKey) {
-    EVP_PKEY* pkey = nullptr;
-    EVP_PKEY_CTX* ctx = nullptr;
-    BIO* keybio = BIO_new_mem_buf((void*)privateKey.c_str(), -1);
-    pkey = PEM_read_bio_PrivateKey(keybio, nullptr, nullptr, nullptr);
-    ctx = EVP_PKEY_CTX_new(pkey, nullptr);
-    EVP_PKEY_decrypt_init(ctx);
-
-    size_t outlen;
-    EVP_PKEY_decrypt(ctx, nullptr, &outlen, (unsigned char*)encryptedData.c_str(), encryptedData.size());
-    std::string decryptedStr(outlen, '\0');
-    EVP_PKEY_decrypt(ctx, (unsigned char*)decryptedStr.data(), &outlen, (unsigned char*)encryptedData.c_str(),
-                     encryptedData.size());
-    decryptedStr.resize(outlen);
-
-    EVP_PKEY_CTX_free(ctx);
-    EVP_PKEY_free(pkey);
-    BIO_free(keybio);
-    return decryptedStr;
 }
 
 // ============== Seeded PRG ==============
@@ -330,245 +153,158 @@ uint64_t Crypto::hashBatchForBits(int baseIndex, const U128* columns, const size
     return result;
 }
 
-uint64_t Crypto::hash64Fast(int index, const U128& v) {
-    // Ultra-fast correlation-robust hash using fixed-key AES
-    // H(index, x) = AES_k(x XOR index_block) XOR x
-    //
-    // Key optimization: Use a single static EVP_CIPHER_CTX with fixed key,
-    // and mix the index into the plaintext instead of the key.
-    // This avoids key schedule computation on every call.
+// ============== Fixed-key AES hashes for IKNP ==============
+//
+// All fast OT hashes use the tweakable correlation-robust (TCCR) construction of Guo, Katz, Wang and Yu, "Efficient
+// and Secure Multiparty Computation from Fixed-Key Block Ciphers" (IEEE S&P 2020), as used by EMP and MP-SPDZ:
+//
+//     H(i, x) = pi(pi(x) XOR i) XOR pi(x)
+//
+// where pi is AES-128 under a fixed public key and the tweak i is the OT index encoded as the block (i, 0). Callers
+// use the low 64 bits (or only the least significant bit) of H.
 
-    // Fixed key for IKNP hashing
-    static const unsigned char FIXED_KEY[16] = {0x49, 0x4B, 0x4E, 0x50, // "IKNP"
-                                                0x48, 0x41, 0x53, 0x48, // "HASH"
-                                                0x4B, 0x45, 0x59, 0x31, // "KEY1"
-                                                0x00, 0x00, 0x00, 0x00};
+namespace {
 
-    // Thread-local AES context - initialized once per thread
-    thread_local struct AesCtxHolder {
-        EVP_CIPHER_CTX* ctx;
-        AesCtxHolder() {
+const unsigned char kFixedAesKey[16] = {0x49, 0x4B, 0x4E, 0x50, // "IKNP"
+                                        0x48, 0x41, 0x53, 0x48, // "HASH"
+                                        0x4B, 0x45, 0x59, 0x31, // "KEY1"
+                                        0x00, 0x00, 0x00, 0x00};
+
+// One fixed-key AES context per thread; key expansion happens once.
+EVP_CIPHER_CTX* fixedKeyAes() {
+    thread_local struct Holder {
+        EVP_CIPHER_CTX* ctx = nullptr;
+        Holder() {
             ctx = EVP_CIPHER_CTX_new();
-            EVP_EncryptInit_ex(ctx, EVP_aes_128_ecb(), nullptr, FIXED_KEY, nullptr);
-            EVP_CIPHER_CTX_set_padding(ctx, 0);
-        }
-        ~AesCtxHolder() {
-            if (ctx)
+            if (ctx == nullptr || EVP_EncryptInit_ex(ctx, EVP_aes_128_ecb(), nullptr, kFixedAesKey, nullptr) != 1 ||
+                EVP_CIPHER_CTX_set_padding(ctx, 0) != 1) {
                 EVP_CIPHER_CTX_free(ctx);
+                ctx = nullptr;
+            }
         }
+        ~Holder() { EVP_CIPHER_CTX_free(ctx); }
     } holder;
+    if (holder.ctx == nullptr) {
+        throw std::runtime_error("Crypto: fixed-key AES setup failed");
+    }
+    return holder.ctx;
+}
 
-    // Mix index into input for domain separation
-    // Use XOR which is fast and provides good mixing
-    alignas(16) unsigned char input[16];
-    alignas(16) unsigned char output[16];
+void permute(const unsigned char* in, unsigned char* out, size_t blocks) {
+    if (blocks == 0) {
+        return;
+    }
+    int outLen = 0;
+    if (EVP_EncryptUpdate(fixedKeyAes(), out, &outLen, in, static_cast<int>(blocks * 16)) != 1 ||
+        outLen != static_cast<int>(blocks * 16)) {
+        throw std::runtime_error("Crypto: fixed-key AES failed");
+    }
+}
 
-    const uint64_t index64 = static_cast<uint64_t>(static_cast<uint32_t>(index));
-    const uint64_t lo_mixed = v.lo ^ index64;
-    const uint64_t hi_mixed = v.hi ^ (index64 * 0x9e3779b97f4a7c15ULL); // Golden ratio constant for better mixing
+// out[k] = low 64 bits of H(index[k], x[k]) for k < n, n <= kMaxTccrBlocks.
+constexpr size_t kMaxTccrBlocks = 256;
 
-    store_u64_le(lo_mixed, input);
-    store_u64_le(hi_mixed, input + 8);
+void tccrLow64(const uint64_t* index, const U128* x, uint64_t* out, size_t n) {
+    if (n > kMaxTccrBlocks) {
+        throw std::invalid_argument("Crypto: too many blocks for one TCCR call");
+    }
+    // Per-thread scratch space, allocated once.
+    thread_local std::vector<unsigned char> bufStorage(kMaxTccrBlocks * 16);
+    thread_local std::vector<unsigned char> pxStorage(kMaxTccrBlocks * 16);
+    unsigned char* buf = bufStorage.data();
+    unsigned char* px = pxStorage.data();
+    for (size_t k = 0; k < n; ++k) {
+        store_u64_le(x[k].lo, buf + k * 16);
+        store_u64_le(x[k].hi, buf + k * 16 + 8);
+    }
+    permute(buf, px, n); // pi(x)
+    for (size_t k = 0; k < n; ++k) {
+        std::memcpy(buf + k * 16, px + k * 16, 16);
+        for (int b = 0; b < 8; ++b) {
+            buf[k * 16 + b] ^= static_cast<unsigned char>(index[k] >> (8 * b));
+        }
+    }
+    permute(buf, buf, n); // pi(pi(x) ^ i)
+    for (size_t k = 0; k < n; ++k) {
+        uint64_t h = 0;
+        uint64_t p = 0;
+        for (int b = 7; b >= 0; --b) {
+            h = (h << 8) | buf[k * 16 + b];
+            p = (p << 8) | px[k * 16 + b];
+        }
+        out[k] = h ^ p;
+    }
+}
 
-    // Single AES block encryption - no re-init needed for ECB with same key
-    int outlen;
-    EVP_EncryptUpdate(holder.ctx, output, &outlen, input, 16);
+inline uint64_t tweak(int index) { return static_cast<uint64_t>(static_cast<uint32_t>(index)); }
 
-    // XOR with original input (Davies-Meyer construction)
-    uint64_t result;
-    std::memcpy(&result, output, sizeof(uint64_t));
-    result ^= v.lo;
+} // namespace
 
-    return result;
+uint64_t Crypto::hash64Fast(int index, const U128& v) {
+    const uint64_t i = tweak(index);
+    uint64_t h = 0;
+    tccrLow64(&i, &v, &h, 1);
+    return h;
 }
 
 uint64_t Crypto::hashBatchForBitsFast(int baseIndex, const U128* columns, const size_t* colIndices, size_t count) {
-    // Fast batch hash using AES for packed-bits IKNP
-    // Returns a 64-bit result where bit i = LSB(hash(columns[colIndices[i]]))
-    // Optimized: reuse AES context across the batch
-
-    if (count == 0)
-        return 0;
-
-    uint64_t result = 0;
-
-    // Create AES context once for the batch
-    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-
-    alignas(16) unsigned char key[16];
-    alignas(16) unsigned char input[16];
-    alignas(16) unsigned char output[16];
-
-    const uint32_t domain = 0x494B4E50; // "IKNP"
-
-    for (size_t i = 0; i < count; ++i) {
-        const size_t colIdx = colIndices[i];
-        const U128& col = columns[colIdx];
-        const int index = baseIndex + static_cast<int>(i);
-
-        // Build key with index for domain separation
-        std::memset(key, 0, 16);
-        std::memcpy(key, &index, sizeof(int));
-        std::memcpy(key + 4, &domain, sizeof(uint32_t));
-
-        // Input is the column value
-        store_u64_le(col.lo, input);
-        store_u64_le(col.hi, input + 8);
-
-        // Single-block AES
-        EVP_EncryptInit_ex(ctx, EVP_aes_128_ecb(), nullptr, key, nullptr);
-        EVP_CIPHER_CTX_set_padding(ctx, 0);
-
-        int outlen;
-        EVP_EncryptUpdate(ctx, output, &outlen, input, 16);
-
-        // XOR with input (Davies-Meyer) and extract LSB
-        uint64_t h;
-        std::memcpy(&h, output, sizeof(uint64_t));
-        h ^= col.lo;
-
-        if (h & 1) {
-            result |= (1ULL << i);
-        }
+    // Bit i of the result is the LSB of H(baseIndex + i, columns[colIndices[i]]), for i < min(count, 64).
+    const size_t n = std::min(count, static_cast<size_t>(64));
+    uint64_t idx[64] = {};
+    U128 in[64] = {};
+    uint64_t h[64] = {};
+    for (size_t i = 0; i < n; ++i) {
+        idx[i] = tweak(baseIndex + static_cast<int>(i));
+        in[i] = columns[colIndices[i]];
     }
-
-    EVP_CIPHER_CTX_free(ctx);
+    tccrLow64(idx, in, h, n);
+    uint64_t result = 0;
+    for (size_t i = 0; i < n; ++i) {
+        result |= (h[i] & 1ULL) << i;
+    }
     return result;
 }
 
 void Crypto::hashTileBatch(int baseIndex, const U128* tile, size_t validCount, uint64_t* hashBits) {
-    // Ultra-fast batch hash for entire tile.
-    // Processes up to 128 columns; packs LSB of each hash into hashBits[0..1].
-    //
-    // Key optimisation: build all 128 (or validCount) input blocks in one
-    // aligned buffer, then encrypt them all in a SINGLE EVP_EncryptUpdate call.
-    // This lets AES-NI pipeline all blocks simultaneously instead of making
-    // 128 individual calls.
-
+    // Hashes up to 128 columns of a tile in one batched AES pass and packs the LSB of each hash into hashBits[0..1].
     hashBits[0] = 0;
     hashBits[1] = 0;
-    if (validCount == 0)
-        return;
-
-    static const unsigned char FIXED_KEY[16] = {0x49, 0x4B, 0x4E, 0x50, // "IKNP"
-                                                0x48, 0x41, 0x53, 0x48, // "HASH"
-                                                0x4B, 0x45, 0x59, 0x31, // "KEY1"
-                                                0x00, 0x00, 0x00, 0x00};
-
-    thread_local struct AesCtxHolder {
-        EVP_CIPHER_CTX* ctx;
-        AesCtxHolder() {
-            ctx = EVP_CIPHER_CTX_new();
-            EVP_EncryptInit_ex(ctx, EVP_aes_128_ecb(), nullptr, FIXED_KEY, nullptr);
-            EVP_CIPHER_CTX_set_padding(ctx, 0);
-        }
-        ~AesCtxHolder() {
-            if (ctx)
-                EVP_CIPHER_CTX_free(ctx);
-        }
-    } holder;
-
     const size_t count = std::min(validCount, static_cast<size_t>(128));
-
-    // Pack all inputs into a contiguous aligned buffer
-    alignas(16) unsigned char inputs[128 * 16];
-    for (size_t k = 0; k < count; ++k) {
-        const U128& col = tile[k];
-        const uint64_t idx64 = static_cast<uint64_t>(static_cast<uint32_t>(baseIndex + static_cast<int>(k)));
-        const uint64_t lo_mixed = col.lo ^ idx64;
-        const uint64_t hi_mixed = col.hi ^ (idx64 * 0x9e3779b97f4a7c15ULL);
-        std::memcpy(inputs + k * 16, &lo_mixed, 8);
-        std::memcpy(inputs + k * 16 + 8, &hi_mixed, 8);
+    if (count == 0) {
+        return;
     }
-
-    // Encrypt all blocks in ONE call
-    alignas(16) unsigned char outputs[128 * 16];
-    int outlen = 0;
-    EVP_EncryptUpdate(holder.ctx, outputs, &outlen, inputs, static_cast<int>(count * 16));
-
-    // Davies-Meyer XOR and extract LSB into hashBits
+    uint64_t idx[128];
+    uint64_t h[128];
     for (size_t k = 0; k < count; ++k) {
-        uint64_t h;
-        std::memcpy(&h, outputs + k * 16, sizeof(uint64_t));
-        const U128& col = tile[k];
-        h ^= col.lo; // Davies-Meyer
-
-        if (h & 1) {
-            if (k < 64)
-                hashBits[0] |= (1ULL << k);
-            else
-                hashBits[1] |= (1ULL << (k - 64));
-        }
+        idx[k] = tweak(baseIndex + static_cast<int>(k));
+    }
+    tccrLow64(idx, tile, h, count);
+    for (size_t k = 0; k < count; ++k) {
+        hashBits[k >> 6] |= (h[k] & 1ULL) << (k & 63);
     }
 }
 
 void Crypto::hashTileBatchPair(int baseIndex, const U128* tile, const U128* tileXorS, size_t validCount,
                                uint64_t* h0Bits, uint64_t* h1Bits) {
-    // Hash tile[0..validCount) AND tileXorS[0..validCount) in ONE EVP_EncryptUpdate.
-    // Layout: [tile[0..cnt), tileXorS[0..cnt)] → 2*cnt AES blocks in one call.
+    // Hashes tile[k] and tileXorS[k] (same tweak) for up to 128 columns in one batched AES pass.
     h0Bits[0] = h0Bits[1] = 0;
     h1Bits[0] = h1Bits[1] = 0;
-    if (validCount == 0)
-        return;
-
-    static const unsigned char FIXED_KEY[16] = {0x49, 0x4B, 0x4E, 0x50, 0x48, 0x41, 0x53, 0x48,
-                                                0x4B, 0x45, 0x59, 0x31, 0x00, 0x00, 0x00, 0x00};
-    thread_local struct AesCtxHolder {
-        EVP_CIPHER_CTX* ctx;
-        AesCtxHolder() {
-            ctx = EVP_CIPHER_CTX_new();
-            EVP_EncryptInit_ex(ctx, EVP_aes_128_ecb(), nullptr, FIXED_KEY, nullptr);
-            EVP_CIPHER_CTX_set_padding(ctx, 0);
-        }
-        ~AesCtxHolder() {
-            if (ctx)
-                EVP_CIPHER_CTX_free(ctx);
-        }
-    } holder;
-
     const size_t count = std::min(validCount, static_cast<size_t>(128));
-
-    // Pack: first 'count' blocks from tile, next 'count' blocks from tileXorS
-    alignas(16) unsigned char inputs[256 * 16];
-    for (size_t k = 0; k < count; ++k) {
-        const uint64_t idx64 = static_cast<uint64_t>(static_cast<uint32_t>(baseIndex + static_cast<int>(k)));
-        const uint64_t mul = idx64 * 0x9e3779b97f4a7c15ULL;
-        {
-            const U128& c = tile[k];
-            uint64_t lo = c.lo ^ idx64, hi = c.hi ^ mul;
-            std::memcpy(inputs + k * 16, &lo, 8);
-            std::memcpy(inputs + k * 16 + 8, &hi, 8);
-        }
-        {
-            const U128& c = tileXorS[k];
-            uint64_t lo = c.lo ^ idx64, hi = c.hi ^ mul;
-            std::memcpy(inputs + (count + k) * 16, &lo, 8);
-            std::memcpy(inputs + (count + k) * 16 + 8, &hi, 8);
-        }
+    if (count == 0) {
+        return;
     }
-
-    alignas(16) unsigned char outputs[256 * 16];
-    int outlen = 0;
-    EVP_EncryptUpdate(holder.ctx, outputs, &outlen, inputs, static_cast<int>(count * 2 * 16));
-
+    uint64_t idx[256];
+    U128 in[256];
+    uint64_t h[256];
     for (size_t k = 0; k < count; ++k) {
-        uint64_t v0, v1;
-        std::memcpy(&v0, outputs + k * 16, 8);
-        std::memcpy(&v1, outputs + (count + k) * 16, 8);
-        v0 ^= tile[k].lo; // Davies-Meyer
-        v1 ^= tileXorS[k].lo;
-        if (v0 & 1) {
-            if (k < 64)
-                h0Bits[0] |= (1ULL << k);
-            else
-                h0Bits[1] |= (1ULL << (k - 64));
-        }
-        if (v1 & 1) {
-            if (k < 64)
-                h1Bits[0] |= (1ULL << k);
-            else
-                h1Bits[1] |= (1ULL << (k - 64));
-        }
+        idx[k] = idx[count + k] = tweak(baseIndex + static_cast<int>(k));
+        in[k] = tile[k];
+        in[count + k] = tileXorS[k];
+    }
+    tccrLow64(idx, in, h, 2 * count);
+    for (size_t k = 0; k < count; ++k) {
+        h0Bits[k >> 6] |= (h[k] & 1ULL) << (k & 63);
+        h1Bits[k >> 6] |= (h[count + k] & 1ULL) << (k & 63);
     }
 }
 

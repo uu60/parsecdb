@@ -69,8 +69,6 @@ void IntermediateDataSupport::init() {
         return;
     }
 
-    prepareBaseOtRsaKeys();
-
     prepareRot();
 
     prepareIknp();
@@ -90,31 +88,6 @@ void IntermediateDataSupport::finalize() {
     delete _rRot0;
     delete _sRot1;
     delete _rRot1;
-}
-
-void IntermediateDataSupport::prepareBaseOtRsaKeys() {
-    if (Comm::isClient()) {
-        return;
-    }
-
-    const int bits = 2048;
-    const int tag = 1;
-
-    // Each rank generates its own RSA key pair
-    for (int i = 0; i < 2; i++) {
-        if (Comm::rank() == i) {
-            // Generate my RSA key pair
-            Crypto::generateRsaKeys(bits);
-            _baseOtSelfPub = Crypto::_selfPubs[bits];
-            _baseOtSelfPri = Crypto::_selfPris[bits];
-
-            // Send public key to the other party
-            Comm::serverSend(_baseOtSelfPub, tag);
-        } else {
-            // Receive the other party's public key
-            Comm::serverReceive(_baseOtOtherPub, tag);
-        }
-    }
 }
 
 void IntermediateDataSupport::prepareRot() {
@@ -294,7 +267,7 @@ void IntermediateDataSupport::prepareIknpDirection(int iknpSender, int msgTagOff
     // IKNP reverses the base-OT roles: the IKNP receiver is the base-OT sender and supplies two seeds per row; the
     // IKNP sender is the base-OT receiver, picks one seed per row with its secret choice bit s_i, and keeps s secret.
     //
-    // Each 128-bit seed is one base OT in 128-bit message mode (low and high words under one RSA exchange).
+    // Each 128-bit seed is one base OT in 128-bit message mode (low and high words under one key exchange).
     constexpr int kRows = 128;
     const int baseOtSender = 1 - iknpSender;
     const bool isBaseOtSender = Comm::rank() == baseOtSender;

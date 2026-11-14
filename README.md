@@ -60,6 +60,14 @@ cmake --build --preset release
 mpirun -np 3 ./build/release/benchmarks/database/db_sort
 ```
 
+Or build and test everything in a container, without installing dependencies locally:
+
+```bash
+docker build -t parsecdb .
+docker run --rm parsecdb
+docker run --rm parsecdb mpirun -np 3 build/release/benchmarks/database/db_sort
+```
+
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow and
 [docs/security-model.md](docs/security-model.md) for the protocol assumptions and current limitations.
 
@@ -69,7 +77,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow and
 - Single-value and batch operators for `AND`, `XOR`, equality, less-than comparison, multiplexing, addition, multiplication, and share conversion.
 - Boolean and arithmetic secret containers with composable methods.
 - BMT generation modes: background, JIT, fixed, and pipeline.
-- OT support, including base OT, random OT, and IKNP-style batch OT.
+- OT support: elliptic-curve base OT (Chou-Orlandi over P-256), random OT, and IKNP OT extension with the TCCR
+  fixed-key AES hash.
 - Communication abstraction with MPI and TCP implementations.
 - Parallel execution support through async, CTPL, and optional TBB thread pools.
 - Secure relational database operators for tables and views, including projection, filtering, sorting, and join.

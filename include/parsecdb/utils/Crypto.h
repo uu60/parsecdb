@@ -1,33 +1,8 @@
-//
-// #ifndef MPC_PACKAGE_CRYPTO_H
-// #define MPC_PACKAGE_CRYPTO_H
-// #include <iostream>
-// #include <unordered_map>
-//
-// #include <string>
-// class Crypto {
-// public:
-//     static std::unordered_map<int, std::string> _selfPubs;
-//     static std::unordered_map<int, std::string> _selfPris;
-//     static std::unordered_map<int, std::string> _otherPubs;
-//
-//     static bool generateRsaKeys(int bits);
-//
-//     static std::string rsaEncrypt(const std::string &data, const std::string &publicKey);
-//
-//     static std::string rsaDecrypt(const std::string &encryptedData, const std::string &privateKey);
-// };
-//
-//
-// #endif
-
 #ifndef MPC_PACKAGE_CRYPTO_H
 #define MPC_PACKAGE_CRYPTO_H
 #include <array>
+#include <cstddef>
 #include <cstdint>
-#include <iostream>
-#include <string>
-#include <unordered_map>
 #include <vector>
 
 // Forward declaration of the OpenSSL cipher context (keeps OpenSSL headers out of this header).
@@ -46,15 +21,6 @@ static_assert(alignof(U128) >= alignof(uint64_t), "U128 alignment unexpected");
 
 class Crypto {
   public:
-    static std::unordered_map<int, std::string> _selfPubs;
-    static std::unordered_map<int, std::string> _selfPris;
-    static std::unordered_map<int, std::string> _otherPubs;
-
-    // RSA encryption methods
-    static bool generateRsaKeys(int bits);
-    static std::string rsaEncrypt(const std::string& data, const std::string& publicKey);
-    static std::string rsaDecrypt(const std::string& encryptedData, const std::string& privateKey);
-
     // PRG keyed by 128-bit seeds, used to expand IKNP base-OT seeds. Seed i is used as an AES-128 key, and block b of
     // stream `stream` is AES_seed_i(nonce.lo ^ b || nonce.hi ^ stream). Key schedules are expanded once in the
     // constructor, so one instance can be reused for many generate() calls with different nonces. An instance is not
@@ -81,8 +47,8 @@ class Crypto {
     // Hash function for OT with 128-bit input (for IKNP columns)
     static uint64_t hash64(int index, const U128& v);
 
-    // Fast AES-based hash for OT (correlation-robust, not cryptographic)
-    // Much faster than SHA-256, sufficient for IKNP OT extension
+    // Fixed-key AES hash for IKNP: low 64 bits of the tweakable correlation-robust hash
+    // H(i, x) = pi(pi(x) XOR i) XOR pi(x) of Guo et al. (IEEE S&P 2020). See Crypto.cpp.
     static uint64_t hash64Fast(int index, const U128& v);
 
     // Batch hash for packed-bits IKNP: computes hashes for a limb (64 consecutive bits)
@@ -99,12 +65,6 @@ class Crypto {
 
     static void hashTileBatchPair(int baseIndex, const U128* tile, const U128* tileXorS, size_t validCount,
                                   uint64_t* h0Bits, uint64_t* h1Bits);
-
-    static void hashMultiTileBatchPair(int baseIndexStart, const U128* tiles, const U128* tilesXorS, size_t numTiles,
-                                       size_t validInLastTile, uint64_t* h0BitsArr, uint64_t* h1BitsArr);
-
-    static void hashMultiTileBatch(int baseIndexStart, const U128* tiles, size_t numTiles, size_t validInLastTile,
-                                   uint64_t* hBitsArr);
 
     // 128x128 bit matrix transpose (in-place)
     static void transpose128x128_inplace(U128 v[128]);

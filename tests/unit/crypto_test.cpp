@@ -171,4 +171,62 @@ TEST(CryptoHash, DeterministicAndIndexDependent) {
     EXPECT_EQ(Crypto::hash64(9, uint64_t{42}), Crypto::hash64(9, uint64_t{42}));
 }
 
+// Reference TCCR hash, low 64 bits: pi(pi(x) ^ (i, 0)) ^ pi(x) with pi = AES-128 under the fixed IKNP key.
+uint64_t referenceTccr(int index, const U128& x) {
+    static const unsigned char key[16] = {0x49, 0x4B, 0x4E, 0x50, 0x48, 0x41, 0x53, 0x48,
+                                          0x4B, 0x45, 0x59, 0x31, 0x00, 0x00, 0x00, 0x00};
+    auto aes = [](const unsigned char in[16], unsigned char out[16]) {
+        EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+        int len = 0;
+        EVP_EncryptInit_ex(ctx, EVP_aes_128_ecb(), nullptr, key, nullptr);
+        EVP_CIPHER_CTX_set_padding(ctx, 0);
+        EVP_EncryptUpdate(ctx, out, &len, in, 16);
+        EVP_CIPHER_CTX_free(ctx);
+    };
+    unsigned char in[16], px[16], y[16], out[16];
+    for (int b = 0; b < 8; ++b) {
+        in[b] = static_cast<unsigned char>(x.lo >> (8 * b));
+        in[8 + b] = static_cast<unsigned char>(x.hi >> (8 * b));
+    }
+    aes(in, px);
+    std::memcpy(y, px, 16);
+    const uint64_t tweak = static_cast<uint32_t>(index);
+    for (int b = 0; b < 8; ++b) {
+        y[b] ^= static_cast<unsigned char>(tweak >> (8 * b));
+    }
+    aes(y, out);
+    uint64_t h = 0;
+    for (int b = 7; b >= 0; --b) {
+        h = (h << 8) | static_cast<uint64_t>(out[b] ^ px[b]);
+    }
+    return h;
+}
+
+TEST(CryptoHash, FastHashIsTccr) {
+    const auto xs = randomSeeds(16, 21);
+    for (size_t i = 0; i < xs.size(); ++i) {
+        const int index = static_cast<int>(i * 977 + 5);
+        EXPECT_EQ(Crypto::hash64Fast(index, xs[i]), referenceTccr(index, xs[i])) << "input " << i;
+    }
+}
+
+TEST(CryptoHash, TileBatchesMatchSingleHash) {
+    constexpr int kBase = 4096;
+    const auto tile = randomSeeds(128, 31);
+    const auto tileXorS = randomSeeds(128, 32);
+    for (size_t valid : {size_t{1}, size_t{63}, size_t{64}, size_t{100}, size_t{128}}) {
+        uint64_t bits[2], h0[2], h1[2];
+        Crypto::hashTileBatch(kBase, tile.data(), valid, bits);
+        Crypto::hashTileBatchPair(kBase, tile.data(), tileXorS.data(), valid, h0, h1);
+        for (size_t k = 0; k < 128; ++k) {
+            const int index = kBase + static_cast<int>(k);
+            const uint64_t e0 = k < valid ? Crypto::hash64Fast(index, tile[k]) & 1 : 0;
+            const uint64_t e1 = k < valid ? Crypto::hash64Fast(index, tileXorS[k]) & 1 : 0;
+            EXPECT_EQ((bits[k / 64] >> (k % 64)) & 1, e0) << "valid " << valid << " column " << k;
+            EXPECT_EQ((h0[k / 64] >> (k % 64)) & 1, e0) << "valid " << valid << " column " << k;
+            EXPECT_EQ((h1[k / 64] >> (k % 64)) & 1, e1) << "valid " << valid << " column " << k;
+        }
+    }
+}
+
 } // namespace

@@ -2,14 +2,164 @@
 
 #include "parsecdb/comm/Comm.h"
 #include "parsecdb/conf/Conf.h"
-#include "parsecdb/intermediate/IntermediateDataSupport.h"
-#include "parsecdb/utils/Math.h"
 #include "parsecdb/utils/System.h"
+#include <array>
 #include <cstring>
+#include <memory>
+#include <openssl/bn.h>
+#include <openssl/crypto.h>
+#include <openssl/ec.h>
+#include <openssl/obj_mac.h>
+#include <openssl/sha.h>
 #include <stdexcept>
 #include <string>
 
 namespace parsecdb {
+
+namespace {
+
+// Compressed SEC1 encoding of a P-256 point.
+constexpr size_t kPointBytes = 33;
+constexpr char kKdfDomain[] = "parsec/base-ot/chou-orlandi/p256/v1";
+
+struct BnFree {
+    void operator()(BIGNUM* bn) const { BN_clear_free(bn); }
+};
+struct PointFree {
+    void operator()(EC_POINT* p) const { EC_POINT_clear_free(p); }
+};
+using BnPtr = std::unique_ptr<BIGNUM, BnFree>;
+using PointPtr = std::unique_ptr<EC_POINT, PointFree>;
+
+// One P-256 group and scratch context. Not thread-safe; every operator execution creates its own.
+class Curve {
+  public:
+    Curve() : _group(EC_GROUP_new_by_curve_name(NID_X9_62_prime256v1)), _ctx(BN_CTX_new()) {
+        if (_group == nullptr || _ctx == nullptr) {
+            release();
+            throw std::runtime_error("BaseOt: failed to set up P-256");
+        }
+    }
+    ~Curve() { release(); }
+    Curve(const Curve&) = delete;
+    Curve& operator=(const Curve&) = delete;
+
+    // Uniform scalar in [1, q-1].
+    BnPtr randomScalar() const {
+        BnPtr k(BN_secure_new());
+        const BIGNUM* order = EC_GROUP_get0_order(_group);
+        if (!k) {
+            throw std::runtime_error("BaseOt: BN allocation failed");
+        }
+        do {
+            if (BN_priv_rand_range(k.get(), order) != 1) {
+                throw std::runtime_error("BaseOt: scalar sampling failed");
+            }
+        } while (BN_is_zero(k.get()));
+        return k;
+    }
+
+    PointPtr newPoint() const {
+        PointPtr p(EC_POINT_new(_group));
+        if (!p) {
+            throw std::runtime_error("BaseOt: point allocation failed");
+        }
+        return p;
+    }
+
+    // k * G
+    PointPtr mulGenerator(const BIGNUM* k) const {
+        PointPtr r = newPoint();
+        if (EC_POINT_mul(_group, r.get(), k, nullptr, nullptr, _ctx) != 1) {
+            throw std::runtime_error("BaseOt: scalar multiplication failed");
+        }
+        return r;
+    }
+
+    // k * P
+    PointPtr mul(const EC_POINT* p, const BIGNUM* k) const {
+        PointPtr r = newPoint();
+        if (EC_POINT_mul(_group, r.get(), nullptr, p, k, _ctx) != 1) {
+            throw std::runtime_error("BaseOt: scalar multiplication failed");
+        }
+        return r;
+    }
+
+    PointPtr add(const EC_POINT* p, const EC_POINT* q) const {
+        PointPtr r = newPoint();
+        if (EC_POINT_add(_group, r.get(), p, q, _ctx) != 1) {
+            throw std::runtime_error("BaseOt: point addition failed");
+        }
+        return r;
+    }
+
+    void invert(EC_POINT* p) const {
+        if (EC_POINT_invert(_group, p, _ctx) != 1) {
+            throw std::runtime_error("BaseOt: point inversion failed");
+        }
+    }
+
+    void encode(const EC_POINT* p, char* out) const {
+        const size_t n = EC_POINT_point2oct(_group, p, POINT_CONVERSION_COMPRESSED,
+                                            reinterpret_cast<unsigned char*>(out), kPointBytes, _ctx);
+        if (n != kPointBytes) {
+            throw std::runtime_error("BaseOt: point encoding failed");
+        }
+    }
+
+    std::string encode(const EC_POINT* p) const {
+        std::string out(kPointBytes, '\0');
+        encode(p, out.data());
+        return out;
+    }
+
+    // Decodes a peer's point. EC_POINT_oct2point checks that the point lies on the curve; the point at infinity is
+    // rejected as well, since it would make both OT keys equal.
+    PointPtr decode(const char* in) const {
+        PointPtr p = newPoint();
+        if (EC_POINT_oct2point(_group, p.get(), reinterpret_cast<const unsigned char*>(in), kPointBytes, _ctx) != 1 ||
+            EC_POINT_is_at_infinity(_group, p.get())) {
+            throw std::runtime_error("BaseOt: received an invalid curve point");
+        }
+        return p;
+    }
+
+  private:
+    void release() {
+        BN_CTX_free(_ctx);
+        EC_GROUP_free(_group);
+        _ctx = nullptr;
+        _group = nullptr;
+    }
+
+    EC_GROUP* _group;
+    BN_CTX* _ctx;
+};
+
+// H(i, A, B, P) = SHA-256(domain || i || A || B || P), truncated to two little-endian 64-bit words.
+std::array<uint64_t, 2> deriveKey(uint64_t index, const char* a, const char* b, const char* p) {
+    unsigned char input[sizeof(kKdfDomain) + 8 + 3 * kPointBytes];
+    unsigned char* w = input;
+    std::memcpy(w, kKdfDomain, sizeof(kKdfDomain));
+    w += sizeof(kKdfDomain);
+    for (int k = 0; k < 8; ++k) {
+        *w++ = static_cast<unsigned char>(index >> (8 * k));
+    }
+    std::memcpy(w, a, kPointBytes);
+    std::memcpy(w + kPointBytes, b, kPointBytes);
+    std::memcpy(w + 2 * kPointBytes, p, kPointBytes);
+    unsigned char digest[SHA256_DIGEST_LENGTH];
+    if (SHA256(input, sizeof(input), digest) == nullptr) {
+        throw std::runtime_error("BaseOt: SHA-256 failed");
+    }
+    std::array<uint64_t, 2> key{};
+    std::memcpy(key.data(), digest, sizeof(key));
+    OPENSSL_cleanse(digest, sizeof(digest));
+    OPENSSL_cleanse(input, sizeof(input));
+    return key;
+}
+
+} // namespace
 
 BaseOtBatchOperator::BaseOtBatchOperator(int sender, std::vector<int64_t>* ms0, std::vector<int64_t>* ms1,
                                          std::vector<int>* choices, int width, int taskTag, int msgTagOffset)
@@ -24,7 +174,7 @@ BaseOtBatchOperator* BaseOtBatchOperator::withHighWords(std::vector<int64_t>* ms
 
 BaseOtBatchOperator* BaseOtBatchOperator::execute() {
     _currentMsgTag = _startMsgTag;
-    if (Comm::isClient()) {
+    if (!Comm::isServer()) {
         return this;
     }
 
@@ -33,9 +183,10 @@ BaseOtBatchOperator* BaseOtBatchOperator::execute() {
         start = System::currentTimeMillis();
     }
 
-    if (Comm::isServer()) {
-        generateAndShareRandoms();
-        process();
+    if (_isSender) {
+        runSender();
+    } else {
+        runReceiver();
     }
 
     if (Conf::ENABLE_CLASS_WISE_TIMING) {
@@ -45,230 +196,114 @@ BaseOtBatchOperator* BaseOtBatchOperator::execute() {
     return this;
 }
 
-void BaseOtBatchOperator::generateAndShareRandoms() {
-    if (_isSender) {
-        RsaKeyContext rsaCtx = Math::loadRsaPrivateKey(IntermediateDataSupport::_baseOtSelfPri);
-        int nbytes = rsaCtx.nbytes;
-        int size = static_cast<int>(_ms0->size());
-
-        _rand0s.resize(size);
-        _rand1s.resize(size);
-
-        std::string payload;
-
-        for (int i = 0; i < size; ++i) {
-            _rand0s[i] = Math::sampleZStarN(rsaCtx);
-            _rand1s[i] = Math::sampleZStarN(rsaCtx);
-
-            uint32_t len = static_cast<uint32_t>(nbytes);
-            payload.append(reinterpret_cast<const char*>(&len), 4);
-            payload.append(_rand0s[i]);
-            payload.append(reinterpret_cast<const char*>(&len), 4);
-            payload.append(_rand1s[i]);
-        }
-
-        Comm::serverSend(payload, buildTag(_currentMsgTag));
-
-    } else {
-        std::string payload;
-        Comm::serverReceive(payload, buildTag(_currentMsgTag));
-
-        RsaKeyContext rsaCtx = Math::loadRsaPublicKey(IntermediateDataSupport::_baseOtOtherPub);
-        int nbytes = rsaCtx.nbytes;
-        int size = static_cast<int>(_choices->size());
-
-        _rand0s.resize(size);
-        _rand1s.resize(size);
-        _randKs.resize(size);
-
-        size_t offset = 0;
-        for (int i = 0; i < size; ++i) {
-            if (offset + 4 > payload.size()) {
-                throw std::runtime_error("generateAndShareRandoms: bad payload - insufficient data for x0 length");
-            }
-            uint32_t len0 = 0;
-            std::memcpy(&len0, payload.data() + offset, 4);
-            offset += 4;
-
-            if (static_cast<int>(len0) != nbytes) {
-                throw std::runtime_error("generateAndShareRandoms: bad payload - x0 length mismatch");
-            }
-            if (offset + len0 > payload.size()) {
-                throw std::runtime_error("generateAndShareRandoms: bad payload - insufficient data for x0");
-            }
-            _rand0s[i] = payload.substr(offset, len0);
-            offset += len0;
-
-            if (offset + 4 > payload.size()) {
-                throw std::runtime_error("generateAndShareRandoms: bad payload - insufficient data for x1 length");
-            }
-            uint32_t len1 = 0;
-            std::memcpy(&len1, payload.data() + offset, 4);
-            offset += 4;
-
-            if (static_cast<int>(len1) != nbytes) {
-                throw std::runtime_error("generateAndShareRandoms: bad payload - x1 length mismatch");
-            }
-            if (offset + len1 > payload.size()) {
-                throw std::runtime_error("generateAndShareRandoms: bad payload - insufficient data for x1");
-            }
-            _rand1s[i] = payload.substr(offset, len1);
-            offset += len1;
-
-            _randKs[i] = Math::sampleZStarN(rsaCtx);
-        }
+void BaseOtBatchOperator::runSender() {
+    const size_t n = _ms0->size();
+    if (_ms1->size() != n ||
+        (_wide && (_ms0Hi == nullptr || _ms1Hi == nullptr || _ms0Hi->size() != n || _ms1Hi->size() != n))) {
+        throw std::invalid_argument("BaseOtBatchOperator: sender message vectors differ in size");
     }
+    const size_t msgBytes = _wide ? 16 : 8;
+    const int tag = buildTag(_currentMsgTag);
+    Curve curve;
+
+    const BnPtr a = curve.randomScalar();
+    const PointPtr bigA = curve.mulGenerator(a.get());
+    const std::string encA = curve.encode(bigA.get());
+    Comm::serverSend(encA, tag);
+
+    std::string allB;
+    Comm::serverReceive(allB, tag);
+    if (allB.size() != n * kPointBytes) {
+        throw std::runtime_error("BaseOtBatchOperator: unexpected receiver message size");
+    }
+
+    // -aA, so that a(B - A) = aB + (-aA).
+    PointPtr negAA = curve.mul(bigA.get(), a.get());
+    curve.invert(negAA.get());
+
+    std::string ciphertexts(n * 2 * msgBytes, '\0');
+    char enc0[kPointBytes];
+    char enc1[kPointBytes];
+    for (size_t i = 0; i < n; ++i) {
+        const char* encB = allB.data() + i * kPointBytes;
+        const PointPtr bigB = curve.decode(encB);
+        const PointPtr p0 = curve.mul(bigB.get(), a.get());
+        const PointPtr p1 = curve.add(p0.get(), negAA.get());
+        curve.encode(p0.get(), enc0);
+        curve.encode(p1.get(), enc1);
+        const auto k0 = deriveKey(i, encA.data(), encB, enc0);
+        const auto k1 = deriveKey(i, encA.data(), encB, enc1);
+
+        const uint64_t c0[2] = {static_cast<uint64_t>((*_ms0)[i]) ^ k0[0],
+                                _wide ? static_cast<uint64_t>((*_ms0Hi)[i]) ^ k0[1] : 0};
+        const uint64_t c1[2] = {static_cast<uint64_t>((*_ms1)[i]) ^ k1[0],
+                                _wide ? static_cast<uint64_t>((*_ms1Hi)[i]) ^ k1[1] : 0};
+        std::memcpy(ciphertexts.data() + (2 * i) * msgBytes, c0, msgBytes);
+        std::memcpy(ciphertexts.data() + (2 * i + 1) * msgBytes, c1, msgBytes);
+    }
+    OPENSSL_cleanse(enc0, sizeof(enc0));
+    OPENSSL_cleanse(enc1, sizeof(enc1));
+
+    Comm::serverSend(ciphertexts, tag);
 }
 
-void BaseOtBatchOperator::process() {
-    int size = _isSender ? static_cast<int>(_ms0->size()) : static_cast<int>(_choices->size());
+void BaseOtBatchOperator::runReceiver() {
+    const size_t n = _choices->size();
+    const size_t msgBytes = _wide ? 16 : 8;
+    const int tag = buildTag(_currentMsgTag);
+    Curve curve;
 
-    if (!_isSender) {
-        RsaKeyContext rsaCtx = Math::loadRsaPublicKey(IntermediateDataSupport::_baseOtOtherPub);
-        int nbytes = rsaCtx.nbytes;
-        std::string e_bytes = Math::getExponentE(rsaCtx);
-
-        std::string allV;
-
-        for (int i = 0; i < size; ++i) {
-            int b = (*_choices)[i] & 1;
-
-            const std::string& xb_bytes = (b == 0) ? _rand0s[i] : _rand1s[i];
-            const std::string& k_bytes = _randKs[i];
-
-            std::string ke_bytes = Math::modExp(k_bytes, e_bytes, rsaCtx);
-
-            std::string v_bytes = Math::modMul(ke_bytes, xb_bytes, rsaCtx);
-
-            uint32_t len = static_cast<uint32_t>(nbytes);
-            allV.append(reinterpret_cast<const char*>(&len), 4);
-            allV.append(v_bytes);
-        }
-
-        Comm::serverSend(allV, buildTag(_currentMsgTag));
-        std::string allM0, allM1;
-        Comm::serverReceive(allM0, buildTag(_currentMsgTag));
-        Comm::serverReceive(allM1, buildTag(_currentMsgTag));
-
-        _results.resize(size);
-        if (_wide) {
-            _resultsHi.resize(size);
-        }
-        const uint32_t expectedLen = _wide ? 16 : 8;
-
-        size_t m0_offset = 0, m1_offset = 0;
-        for (int i = 0; i < size; ++i) {
-            int b = (*_choices)[i] & 1;
-
-            if (m0_offset + 4 > allM0.size()) {
-                throw std::runtime_error("process: bad allM0 - insufficient data for length");
-            }
-            uint32_t len0 = 0;
-            std::memcpy(&len0, allM0.data() + m0_offset, 4);
-            m0_offset += 4;
-
-            if (len0 != expectedLen) {
-                throw std::runtime_error("process: bad allM0 - unexpected message length");
-            }
-            if (m0_offset + len0 > allM0.size()) {
-                throw std::runtime_error("process: bad allM0 - insufficient data for ciphertext");
-            }
-            int64_t c0[2] = {0, 0};
-            std::memcpy(c0, allM0.data() + m0_offset, len0);
-            m0_offset += len0;
-
-            if (m1_offset + 4 > allM1.size()) {
-                throw std::runtime_error("process: bad allM1 - insufficient data for length");
-            }
-            uint32_t len1 = 0;
-            std::memcpy(&len1, allM1.data() + m1_offset, 4);
-            m1_offset += 4;
-
-            if (len1 != expectedLen) {
-                throw std::runtime_error("process: bad allM1 - unexpected message length");
-            }
-            if (m1_offset + len1 > allM1.size()) {
-                throw std::runtime_error("process: bad allM1 - insufficient data for ciphertext");
-            }
-            int64_t c1[2] = {0, 0};
-            std::memcpy(c1, allM1.data() + m1_offset, len1);
-            m1_offset += len1;
-
-            const auto pad = Math::kdfSha256To16Bytes(_randKs[i]);
-            const int64_t* cb = (b == 0) ? c0 : c1;
-            _results[i] = cb[0] ^ static_cast<int64_t>(pad[0]);
-            if (_wide) {
-                _resultsHi[i] = cb[1] ^ static_cast<int64_t>(pad[1]);
-            }
-        }
-
-    } else {
-        RsaKeyContext rsaCtx = Math::loadRsaPrivateKey(IntermediateDataSupport::_baseOtSelfPri);
-        int nbytes = rsaCtx.nbytes;
-        std::string d_bytes = Math::getExponentD(rsaCtx);
-
-        std::string allV;
-        Comm::serverReceive(allV, buildTag(_currentMsgTag));
-
-        std::string allM0, allM1;
-
-        size_t v_offset = 0;
-        for (int i = 0; i < size; ++i) {
-            if (v_offset + 4 > allV.size()) {
-                throw std::runtime_error("process: bad allV - insufficient data for v length");
-            }
-            uint32_t vlen = 0;
-            std::memcpy(&vlen, allV.data() + v_offset, 4);
-            v_offset += 4;
-
-            if (static_cast<int>(vlen) != nbytes) {
-                throw std::runtime_error("process: bad allV - v length mismatch");
-            }
-            if (v_offset + vlen > allV.size()) {
-                throw std::runtime_error("process: bad allV - insufficient data for v");
-            }
-            std::string v_bytes = allV.substr(v_offset, vlen);
-            v_offset += vlen;
-
-            std::string y_bytes = Math::rsaDecrypt(v_bytes, rsaCtx);
-
-            std::string x0d_bytes = Math::modExp(_rand0s[i], d_bytes, rsaCtx);
-            std::string x1d_bytes = Math::modExp(_rand1s[i], d_bytes, rsaCtx);
-
-            std::string inv0_bytes, inv1_bytes;
-            try {
-                inv0_bytes = Math::modInverse(x0d_bytes, rsaCtx);
-            } catch (const std::exception& ex) {
-                throw std::runtime_error("process: modInverse failed for x0d at i=" + std::to_string(i));
-            }
-            try {
-                inv1_bytes = Math::modInverse(x1d_bytes, rsaCtx);
-            } catch (const std::exception& ex) {
-                throw std::runtime_error("process: modInverse failed for x1d at i=" + std::to_string(i));
-            }
-
-            std::string k0_bytes = Math::modMul(y_bytes, inv0_bytes, rsaCtx);
-            std::string k1_bytes = Math::modMul(y_bytes, inv1_bytes, rsaCtx);
-
-            const auto pad0 = Math::kdfSha256To16Bytes(k0_bytes);
-            const auto pad1 = Math::kdfSha256To16Bytes(k1_bytes);
-
-            const int64_t c0[2] = {(*_ms0)[i] ^ static_cast<int64_t>(pad0[0]),
-                                   _wide ? (*_ms0Hi)[i] ^ static_cast<int64_t>(pad0[1]) : 0};
-            const int64_t c1[2] = {(*_ms1)[i] ^ static_cast<int64_t>(pad1[0]),
-                                   _wide ? (*_ms1Hi)[i] ^ static_cast<int64_t>(pad1[1]) : 0};
-
-            const uint32_t len = _wide ? 16 : 8;
-            allM0.append(reinterpret_cast<const char*>(&len), 4);
-            allM0.append(reinterpret_cast<const char*>(c0), len);
-
-            allM1.append(reinterpret_cast<const char*>(&len), 4);
-            allM1.append(reinterpret_cast<const char*>(c1), len);
-        }
-
-        Comm::serverSend(allM0, buildTag(_currentMsgTag));
-        Comm::serverSend(allM1, buildTag(_currentMsgTag));
+    std::string encA;
+    Comm::serverReceive(encA, tag);
+    if (encA.size() != kPointBytes) {
+        throw std::runtime_error("BaseOtBatchOperator: unexpected sender message size");
     }
+    const PointPtr bigA = curve.decode(encA.data());
+
+    std::vector<BnPtr> bs;
+    bs.reserve(n);
+    std::string allB(n * kPointBytes, '\0');
+    for (size_t i = 0; i < n; ++i) {
+        bs.push_back(curve.randomScalar());
+        PointPtr bigB = curve.mulGenerator(bs.back().get());
+        if ((*_choices)[i] & 1) {
+            bigB = curve.add(bigB.get(), bigA.get());
+        }
+        curve.encode(bigB.get(), allB.data() + i * kPointBytes);
+    }
+    Comm::serverSend(allB, tag);
+
+    // The keys depend only on values already known, so derive them before waiting for the ciphertexts.
+    std::vector<std::array<uint64_t, 2>> keys(n);
+    char encP[kPointBytes];
+    for (size_t i = 0; i < n; ++i) {
+        const PointPtr p = curve.mul(bigA.get(), bs[i].get());
+        curve.encode(p.get(), encP);
+        keys[i] = deriveKey(i, encA.data(), allB.data() + i * kPointBytes, encP);
+    }
+    OPENSSL_cleanse(encP, sizeof(encP));
+    bs.clear();
+
+    std::string ciphertexts;
+    Comm::serverReceive(ciphertexts, tag);
+    if (ciphertexts.size() != n * 2 * msgBytes) {
+        throw std::runtime_error("BaseOtBatchOperator: unexpected ciphertext size");
+    }
+
+    _results.resize(n);
+    if (_wide) {
+        _resultsHi.resize(n);
+    }
+    for (size_t i = 0; i < n; ++i) {
+        const int b = (*_choices)[i] & 1;
+        uint64_t c[2] = {0, 0};
+        std::memcpy(c, ciphertexts.data() + (2 * i + b) * msgBytes, msgBytes);
+        _results[i] = static_cast<int64_t>(c[0] ^ keys[i][0]);
+        if (_wide) {
+            _resultsHi[i] = static_cast<int64_t>(c[1] ^ keys[i][1]);
+        }
+    }
+    OPENSSL_cleanse(keys.data(), keys.size() * sizeof(keys[0]));
 }
 
 int BaseOtBatchOperator::tagStride() { return 1; }

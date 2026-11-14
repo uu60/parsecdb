@@ -47,17 +47,10 @@ class IntermediateDataSupport {
     inline static std::vector<bool> _iknpSenderChoices0;
     inline static std::vector<bool> _iknpSenderChoices1;
 
-    // RSA keys for BaseOT, pre-generated at initialization
-    inline static std::string _baseOtSelfPub;
-    inline static std::string _baseOtSelfPri;
-    inline static std::string _baseOtOtherPub;
-
   public:
     static void prepareBmt();
 
     static void prepareRot();
-
-    static void prepareBaseOtRsaKeys();
 
     static void startGenerateBmtsAsync();
 

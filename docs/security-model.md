@@ -32,11 +32,17 @@ Shares, masks, BMT inputs, OT messages and choice bits are drawn from OpenSSL's 
 bias. `Math::randInt()` without arguments returns only non-negative values and is meant for generating plaintext test
 data, not for protocol randomness.
 
-The IKNP OT extension between the servers transfers 128-bit seeds through 128 RSA-2048 base OTs per direction
-(RSA-2048 corresponds to roughly 112-bit security) and expands each seed with AES-128 keyed by that seed. The IKNP
-receiver picks a fresh 128-bit nonce for every execution, so PRG output is never reused, and the IKNP sender's choice
-bits never leave the sender. The OT output hash is a fixed-key AES construction with an index tweak; libraries such as
-MP-SPDZ and EMP use the stronger tweakable correlation-robust form from Guo et al. (2020).
+Base OTs use the Chou-Orlandi "simplest OT" protocol over NIST P-256 (about 128-bit security). The sender draws a fresh
+key pair on every execution, received points are checked to lie on the curve and not to be the point at infinity, and
+the OT keys are derived with domain-separated SHA-256 over the OT index, both public points and the shared point. The
+construction is secure against semi-honest parties under the computational Diffie-Hellman assumption in the random
+oracle model.
+
+The IKNP OT extension between the servers transfers 128-bit seeds through 128 such base OTs per direction and expands
+each seed with AES-128 keyed by that seed. The IKNP receiver picks a fresh 128-bit nonce for every execution, so PRG
+output is never reused, and the IKNP sender's choice bits never leave the sender. The OT output hash is the tweakable
+correlation-robust hash `H(i, x) = pi(pi(x) XOR i) XOR pi(x)` from Guo et al. (IEEE S&P 2020), where `pi` is fixed-key
+AES-128 and the tweak `i` is the OT index; MP-SPDZ and EMP use the same construction.
 
 `RandOtOperator` and `RandOtBatchOperator` are not secure: they mask every transfer with one random OT prepared at
 start-up, so the receiver can learn unchosen messages. They remain only for benchmarks, log a warning when used, and no

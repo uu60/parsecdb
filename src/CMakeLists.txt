@@ -51,7 +51,7 @@ target_link_libraries(parsecdb PUBLIC MPI::MPI_CXX OpenSSL::SSL OpenSSL::Crypto 
 if (TBB_FOUND)
     target_link_libraries(parsecdb PUBLIC ${TBB_LIBRARIES})
     # Public headers change with this flag, so consumers must see it too.
-    target_compile_definitions(parsec PUBLIC PARSEC_HAS_TBB)
+    target_compile_definitions(parsecdb PUBLIC PARSEC_HAS_TBB)
 endif ()
 install(TARGETS parsecdb EXPORT parsecdbTargets)
 
