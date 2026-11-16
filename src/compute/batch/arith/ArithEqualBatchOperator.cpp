@@ -21,11 +21,6 @@ ArithEqualBatchOperator* ArithEqualBatchOperator::execute() {
         return this;
     }
 
-    if (Conf::BMT_METHOD != Conf::BMT_JIT && Conf::BMT_METHOD != Conf::BMT_FIXED) {
-        throw std::runtime_error(
-            "ArithEqualBatchOperator: Temporarily only support BMT JIT or FIXED generation for experiment.");
-    }
-
     int64_t start = 0;
     if (Conf::ENABLE_CLASS_WISE_TIMING) {
         start = System::currentTimeMillis();

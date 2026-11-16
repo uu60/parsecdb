@@ -3,6 +3,8 @@
 
 #include "parsecdb/comm/Comm.h"
 
+#include <stdexcept>
+
 #include <vector>
 
 #include "parsecdb/comm/MpiComm.h"
@@ -230,6 +232,10 @@ AbstractRequest* Comm::serverReceiveAsync(std::string& target, int length, int t
 }
 
 void Comm::wait(AbstractRequest* request) {
+    // The asynchronous calls return nullptr when the transfer could not be started (for example an invalid tag).
+    if (request == nullptr) {
+        throw std::runtime_error("Comm::wait: the asynchronous send or receive failed to start");
+    }
     try {
         request->wait();
         delete request;

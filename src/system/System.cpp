@@ -51,7 +51,9 @@ int System::nextTask() { return std::max(PRESERVED_TASK_TAGS, 2); }
 
 int System::auxiliaryTask(int k) {
     const int task = nextTask() + k;
-    if (k < 1 || task >= (1 << Conf::TASK_TAG_BITS)) {
+    // The task occupies the top Conf::TASK_TAG_BITS bits of a 32-bit message tag; its highest bit would be the sign
+    // bit, and MPI rejects negative tags.
+    if (k < 1 || task >= (1 << (Conf::TASK_TAG_BITS - 1))) {
         throw std::out_of_range("System::auxiliaryTask: task tag " + std::to_string(task) + " does not fit in " +
                                 std::to_string(Conf::TASK_TAG_BITS) +
                                 " task-tag bits; reduce --bmt_queue_num or "

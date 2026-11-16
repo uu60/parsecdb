@@ -34,6 +34,21 @@ ArithMutexBatchOperator* ArithMutexBatchOperator::execute() {
     int num = static_cast<int>(_xis->size());
     _zis.resize(num);
 
+    // BMTs of the two multiplications: the assigned ones, or with background BMTs both halves taken here, on this
+    // thread, so that the multiplications never poll the queue concurrently.
+    std::vector<Bmt> cxBmts, cyBmts;
+    bool ownBmts = false;
+    if (_bmts != nullptr || Conf::BMT_METHOD == Conf::BMT_BACKGROUND) {
+        std::vector<Bmt> all =
+            _bmts != nullptr ? std::move(*_bmts) : IntermediateDataSupport::pollBmts(2 * num, _width);
+        if (all.size() != static_cast<size_t>(2 * num)) {
+            throw std::runtime_error("ArithMutexBatchOperator: Mismatch BMT size.");
+        }
+        cxBmts.assign(all.begin(), all.begin() + num);
+        cyBmts.assign(all.begin() + num, all.end());
+        ownBmts = true;
+    }
+
     std::vector<int64_t> cx_results, cy_results;
     std::future<std::vector<int64_t>> f;
 
@@ -41,17 +56,17 @@ ArithMutexBatchOperator* ArithMutexBatchOperator::execute() {
         f = ThreadPoolSupport::submit([&]() -> std::vector<int64_t> {
             auto mul_cx =
                 ArithMultiplyBatchOperator(&_conds_i, _xis, _width, _taskTag, _currentMsgTag, NO_CLIENT_COMPUTE);
-            return mul_cx.execute()->_zis;
+            return mul_cx.setBmts(ownBmts ? &cxBmts : nullptr)->execute()->_zis;
         });
     } else {
         auto mul_cx = ArithMultiplyBatchOperator(&_conds_i, _xis, _width, _taskTag, _currentMsgTag, NO_CLIENT_COMPUTE);
-        cx_results = mul_cx.execute()->_zis;
+        cx_results = mul_cx.setBmts(ownBmts ? &cxBmts : nullptr)->execute()->_zis;
     }
 
     auto mul_cy =
         ArithMultiplyBatchOperator(&_conds_i, _yis, _width, _taskTag,
                                    _currentMsgTag + ArithMultiplyBatchOperator::tagStride(_width), NO_CLIENT_COMPUTE);
-    cy_results = mul_cy.execute()->_zis;
+    cy_results = mul_cy.setBmts(ownBmts ? &cyBmts : nullptr)->execute()->_zis;
 
     if (Conf::ENABLE_INTRA_OPERATOR_PARALLELISM) {
         cx_results = f.get();

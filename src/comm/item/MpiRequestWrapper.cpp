@@ -33,7 +33,6 @@ void MpiRequestWrapper::wait() {
             for (int i = 0; i < _vec1Size; i++) {
                 (*_targetIntVec)[i] = _vec1[i];
             }
-            delete[] _vec1;
             break;
         case VEC8:
             _targetIntVec->resize(_vec8.size());
@@ -56,36 +55,8 @@ void MpiRequestWrapper::wait() {
         default:
             break;
         }
-    } else {
-        switch (_mode) {
-        case INT1:
-            delete _si1;
-            break;
-        case INT8:
-            delete _si8;
-            break;
-        case INT16:
-            delete _si16;
-            break;
-        case INT32:
-            delete _si32;
-            break;
-        case VEC1:
-            delete[] _sv1;
-            break;
-        case VEC8:
-            delete _sv8;
-            break;
-        case VEC16:
-            delete _sv16;
-            break;
-        case VEC32:
-            delete _sv32;
-            break;
-        default:
-            break;
-        }
     }
+    // Send buffers stay alive until the destructor frees them; freeing them here as well freed them twice.
 }
 
 } // namespace parsecdb

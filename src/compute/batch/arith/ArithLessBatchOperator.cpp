@@ -21,11 +21,6 @@ ArithLessBatchOperator* ArithLessBatchOperator::execute() {
         return this;
     }
 
-    if (Conf::BMT_METHOD != Conf::BMT_JIT && Conf::BMT_METHOD != Conf::BMT_FIXED) {
-        throw std::runtime_error(
-            "ArithLessBatchOperator: Temporarily only support BMT JIT or FIXED generation for experiment.");
-    }
-
     int64_t start = 0;
     if (Conf::ENABLE_CLASS_WISE_TIMING) {
         start = System::currentTimeMillis();
@@ -39,7 +34,7 @@ ArithLessBatchOperator* ArithLessBatchOperator::execute() {
     }
 
     ArithToBoolBatchOperator toBoolOp(&a_deltas, _width, _taskTag, _currentMsgTag, NO_CLIENT_COMPUTE);
-    toBoolOp.execute();
+    toBoolOp.setBmts(_bmts)->execute();
 
     _zis.resize(num);
     for (int i = 0; i < num; i++) {
@@ -66,5 +61,12 @@ ArithLessBatchOperator* ArithLessBatchOperator::reconstruct(int clientRank) {
 }
 
 int ArithLessBatchOperator::tagStride(int width) { return ArithToBoolBatchOperator::tagStride(width); }
+
+ArithLessBatchOperator* ArithLessBatchOperator::setBmts(std::vector<BitwiseBmt>* bmts) {
+    _bmts = bmts;
+    return this;
+}
+
+int ArithLessBatchOperator::bmtCount(int num, int width) { return ArithToBoolBatchOperator::bmtCount(num, width); }
 
 } // namespace parsecdb

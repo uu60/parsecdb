@@ -22,6 +22,14 @@ class ArithLessBatchOperator : public ArithBatchOperator {
     ArithLessBatchOperator* reconstruct(int clientRank) override;
 
     static int tagStride(int width);
+
+    // Background BMTs for the A2B conversion inside (bmtCount(n, width) of them, consumed by execute()).
+    ArithLessBatchOperator* setBmts(std::vector<BitwiseBmt>* bmts);
+
+    [[nodiscard]] static int bmtCount(int num, int width);
+
+  private:
+    std::vector<BitwiseBmt>* _bmts{};
 };
 
 } // namespace parsecdb

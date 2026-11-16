@@ -71,18 +71,35 @@ struct BoolCompareSwap {
 
 struct ArithCompareSwap {
     using SecretT = ArithSecret;
-    struct Bmts {};
+
+    // Background BMTs for one batch, polled on the calling thread (see BoolCompareSwap).
+    struct Bmts {
+        std::vector<BitwiseBmt> less;
+        std::vector<Bmt> mux;
+    };
 
     static int tagStride(int width) {
         return std::max(ArithLessBatchOperator::tagStride(width), ArithMutexBatchOperator::tagStride(width));
     }
 
-    static std::shared_ptr<Bmts> pollBmts(size_t /*n*/, int /*width*/) { return std::make_shared<Bmts>(); }
+    static std::shared_ptr<Bmts> pollBmts(size_t n, int width) {
+        auto bmts = std::make_shared<Bmts>();
+        if (Conf::BMT_METHOD == Conf::BMT_BACKGROUND) {
+            const int count = static_cast<int>(n);
+            bmts->less = IntermediateDataSupport::pollBitwiseBmts(ArithLessBatchOperator::bmtCount(count, width), 64);
+            // One mux over both orders: 2n elements.
+            bmts->mux = IntermediateDataSupport::pollBmts(ArithMutexBatchOperator::bmtCount(width, 2 * count), width);
+        }
+        return bmts;
+    }
 
     static std::vector<int64_t> swap(std::vector<int64_t>& xs, std::vector<int64_t>& ys, const std::vector<bool>& ascs,
-                                     int width, int taskTag, int msgTag, Bmts& /*bmts*/) {
-        auto conds =
-            ArithLessBatchOperator(&xs, &ys, width, taskTag, msgTag, SecureOperator::NO_CLIENT_COMPUTE).execute()->_zis;
+                                     int width, int taskTag, int msgTag, Bmts& bmts) {
+        const bool background = Conf::BMT_METHOD == Conf::BMT_BACKGROUND;
+        auto conds = ArithLessBatchOperator(&xs, &ys, width, taskTag, msgTag, SecureOperator::NO_CLIENT_COMPUTE)
+                         .setBmts(background ? &bmts.less : nullptr)
+                         ->execute()
+                         ->_zis;
         flipDescending(conds, ascs);
         // One mux over the concatenation computes both outputs: (c ? x : y) and (c ? y : x).
         const size_t n = xs.size();
@@ -97,7 +114,8 @@ struct ArithCompareSwap {
         conds2.insert(conds2.end(), conds.begin(), conds.end());
         conds2.insert(conds2.end(), conds.begin(), conds.end());
         return ArithMutexBatchOperator(&lhs, &rhs, &conds2, width, taskTag, msgTag, SecureOperator::NO_CLIENT_COMPUTE)
-            .execute()
+            .setBmts(background ? &bmts.mux : nullptr)
+            ->execute()
             ->_zis;
     }
 };
