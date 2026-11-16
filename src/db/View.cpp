@@ -368,9 +368,6 @@ void View::swapRows(const std::vector<int>& xIdx, const std::vector<int>& yIdx, 
 
 namespace {
 
-// Task tag of the concurrent comparisons of filterAndConditions().
-constexpr int FILTER_TASK_TAG = 3;
-
 // Compares every element of data with the constant in consts (same size) and returns the condition bits.
 Shares compareWithConst(Shares& data, Shares& consts, int width, View::ComparatorType ct, int msgTag,
                         std::vector<BitwiseBmt>* bmts, int taskTag) {
@@ -458,7 +455,8 @@ void View::filterAndConditions(std::vector<std::string>& fieldNames, std::vector
     const BatchPlan plan = planBatches(_dataCols[0].size());
     const int nb = plan.numBatches;
     const int tagOffset = std::max(BoolLessBatchOperator::tagStride(), BoolEqualBatchOperator::tagStride());
-    const int taskTag = plan.parallel ? FILTER_TASK_TAG : 0;
+    // Concurrent comparisons run in their own task, apart from the query and the background BMT generators.
+    const int taskTag = plan.parallel ? System::auxiliaryTask(1) : 0;
     auto isEquality = [&](int i) { return comparatorTypes[i] == EQUALS || comparatorTypes[i] == NOT_EQUALS; };
     auto parts = runTasks(
         static_cast<int>(condNum) * nb, plan.parallel,
@@ -847,9 +845,8 @@ void View::countSorted(std::vector<int64_t>& heads, const std::string& alias, co
     // outer join, matched rows) count.
     Shares bsBool = andOp(heads, _dataCols[validIdx], msgTagBase);
     Shares counts = _dataCols[validIdx];
-    // Latent inconsistency kept from the former implementations: only the single-batch one applied the outer-join
-    // match column, the multi-batch one (used when the rows exceed one batch) ignored it.
-    if (!matchedTable.empty() && !exceedsOneBatch(n)) {
+    // After an outer join, rows without a match on the counted side do not count (as COUNT(column) in SQL).
+    if (!matchedTable.empty()) {
         counts = andOp(counts, _dataCols[colIndex(OUTER_MATCH_PREFIX + matchedTable)], msgTagBase);
     }
 
@@ -927,11 +924,8 @@ void View::max(std::vector<int64_t>& heads, const std::string& fieldName, std::s
         Log::e("Field '{}' not found for max operation", fieldName);
         return;
     }
-    // Latent bug kept from the former multi-batch implementation (used when the rows exceed one batch): it wrote the
-    // new validity into the column index the valid column had before the max column was inserted, i.e. into the max
-    // column itself.
     groupExtremes(heads, {{fieldIdx, _fieldWidths[fieldIdx], true, alias.empty() ? "max_" + fieldName : alias}},
-                  exceedsOneBatch(rowNum()), msgTagBase);
+                  msgTagBase);
 }
 
 void View::min(std::vector<int64_t>& heads, const std::string& fieldName, std::string alias, int msgTagBase) {
@@ -943,7 +937,7 @@ void View::min(std::vector<int64_t>& heads, const std::string& fieldName, std::s
         Log::e("Field '{}' not found for min operation", fieldName);
         return;
     }
-    groupExtremes(heads, {{fieldIdx, _fieldWidths[fieldIdx], false, alias.empty() ? "min_" + fieldName : alias}}, false,
+    groupExtremes(heads, {{fieldIdx, _fieldWidths[fieldIdx], false, alias.empty() ? "min_" + fieldName : alias}},
                   msgTagBase);
 }
 
@@ -967,11 +961,10 @@ void View::minAndMax(std::vector<int64_t>& heads, const std::string& minFieldNam
     groupExtremes(heads,
                   {{minIdx, _fieldWidths[minIdx], false, minAlias.empty() ? "min_" + minFieldName : minAlias},
                    {maxIdx, _fieldWidths[maxIdx], true, maxAlias.empty() ? "max_" + maxFieldName : maxAlias}},
-                  false, msgTagBase);
+                  msgTagBase);
 }
 
-void View::groupExtremes(std::vector<int64_t>& heads, const std::vector<ExtremeSpec>& specs, bool legacyValidIdx,
-                         int msgTagBase) {
+void View::groupExtremes(std::vector<int64_t>& heads, const std::vector<ExtremeSpec>& specs, int msgTagBase) {
     const size_t n = rowNum();
     for (const auto& s : specs) {
         if (_dataCols[s.srcIdx].size() != n || heads.size() != n) {
@@ -1089,7 +1082,8 @@ void View::groupExtremes(std::vector<int64_t>& heads, const std::vector<ExtremeS
         _dataCols.insert(_dataCols.begin() + insertPos + a, std::move(vs[a]));
     }
 
-    applyGroupTails(legacyValidIdx ? validIdx : colNum() + VALID_COL_OFFSET, tails, true, msgTagBase);
+    // The valid column moved behind the inserted aggregate columns.
+    applyGroupTails(colNum() + VALID_COL_OFFSET, tails, true, msgTagBase);
 }
 
 void View::distinct(int msgTagBase) {

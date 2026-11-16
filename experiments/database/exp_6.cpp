@@ -254,7 +254,7 @@ View filterLineitemByCommitDate(View& lineitem_view, int tid) {
 
     // This filter may run concurrently with filterOrdersByDate, so it uses its own task tag (an offset added to tid
     // would be dropped by SecureOperator::buildTag).
-    const int lineitemTaskTag = 5;
+    const int lineitemTaskTag = System::auxiliaryTask(3);
     if (Conf::BATCH_SIZE <= 0 || Conf::DISABLE_MULTI_THREAD) {
         comparison_result = BoolLessBatchOperator(&commitdate_col, &receiptdate_col, 64, lineitemTaskTag, 0,
                                                   SecureOperator::NO_CLIENT_COMPUTE)

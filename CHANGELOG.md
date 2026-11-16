@@ -50,6 +50,16 @@ Until 1.0.0, minor versions may contain breaking API changes.
   background BMTs.
 
 ### Fixed
+- Grouped `max` over more rows than one batch wrote the new validity into the max column instead of `$valid`, and
+  `count` after an outer join counted unmatched rows when the rows exceeded one batch. Both now behave like the
+  single-batch path at every size; `tests/database/correctness_db_aggregates` checks them against plaintext.
+- Background BMTs with `--disable_multi_thread=true` hung at start-up (the generator loop ran on the calling thread) and
+  then crashed inside MPI (initialized without thread support). Generators now get their own threads and MPI is
+  initialized with `MPI_THREAD_MULTIPLE` whenever background BMTs are used.
+- `System::nextTask()` used the task-tag bit count as a mask; it now plainly returns the fixed query task after the
+  background generators' tags. The filter, nested-loop-join and `exp_6` task tags, previously hard-coded as 3, 4 and 5,
+  come from `System::auxiliaryTask()` so they move past the generators' tags with more `--bmt_queue_num` queues
+  (unchanged values with the defaults) and fail loudly when they do not fit in `--task_tag_bits`.
 
 - Background BMT mode (`--bmt_method=bmt_background --disable_arith=false`) works again, porting the fixes of the
   reviewed artifact release: message tags no longer drop the high bits of database message tags (which aliased

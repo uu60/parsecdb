@@ -19,7 +19,8 @@ void MpiComm::finalize_() {
 }
 
 void MpiComm::init_(int argc, char** argv) {
-    if (Conf::DISABLE_MULTI_THREAD) {
+    // Background BMT generators communicate from their own threads even when operators run single-threaded.
+    if (Conf::DISABLE_MULTI_THREAD && Conf::BMT_METHOD != Conf::BMT_BACKGROUND) {
         MPI_Init(&argc, &argv);
     } else {
         int provided;

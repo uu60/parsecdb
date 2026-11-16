@@ -130,8 +130,7 @@ class View : public Table {
     void countSorted(std::vector<int64_t>& heads, const std::string& alias, const std::string& matchedTable,
                      bool compress, int msgTagBase);
 
-    void groupExtremes(std::vector<int64_t>& heads, const std::vector<ExtremeSpec>& specs, bool legacyValidIdx,
-                       int msgTagBase);
+    void groupExtremes(std::vector<int64_t>& heads, const std::vector<ExtremeSpec>& specs, int msgTagBase);
 };
 
 } // namespace parsecdb

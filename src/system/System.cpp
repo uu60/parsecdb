@@ -9,6 +9,9 @@
 #include "parsecdb/parallel/ThreadPoolSupport.h"
 #include "parsecdb/utils/Log.h"
 #include "parsecdb/utils/Math.h"
+#include <algorithm>
+#include <stdexcept>
+#include <string>
 
 namespace parsecdb {
 
@@ -44,14 +47,17 @@ void System::finalize() {
     }
 }
 
-int System::nextTask() {
-    int nextTask = _currentTaskTag & Conf::TASK_TAG_BITS;
+int System::nextTask() { return std::max(PRESERVED_TASK_TAGS, 2); }
 
-    if (nextTask < 0 || nextTask < PRESERVED_TASK_TAGS) {
-        _currentTaskTag = PRESERVED_TASK_TAGS;
+int System::auxiliaryTask(int k) {
+    const int task = nextTask() + k;
+    if (k < 1 || task >= (1 << Conf::TASK_TAG_BITS)) {
+        throw std::out_of_range("System::auxiliaryTask: task tag " + std::to_string(task) + " does not fit in " +
+                                std::to_string(Conf::TASK_TAG_BITS) +
+                                " task-tag bits; reduce --bmt_queue_num or "
+                                "raise --task_tag_bits.");
     }
-
-    return _currentTaskTag;
+    return task;
 }
 
 int64_t System::currentTimeMillis() {

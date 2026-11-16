@@ -21,10 +21,6 @@ using namespace db;
 
 namespace {
 
-// Task tag of nestedLoopJoin()'s operators, whose message tags carry no task prefix: keeps them apart from the
-// background BMT generators, which own the lowest task tags.
-constexpr int JOIN_TASK_TAG = 4;
-
 // Message tag base, with the foreground task prefix, for the operators below that have no msgTagBase parameter.
 // A plain 0 would put their traffic in task 0, which belongs to a background BMT generator.
 int foregroundTagBase() { return System::nextTask() << (32 - Conf::TASK_TAG_BITS); }
@@ -135,6 +131,9 @@ View Views::nestedLoopJoin(View& v0, View& v1, std::string& field0, std::string&
     const int keyWidth = v0._fieldWidths[colIndex0];
 
     const bool BASELINE = DbConf::BASELINE_MODE;
+    // The operators below use message tags without a task prefix; their own task keeps them apart from the query and
+    // the background BMT generators.
+    const int joinTask = System::auxiliaryTask(2);
 
     const int validIdx0 = v0.colNum() + View::VALID_COL_OFFSET;
     const int validIdx1 = v1.colNum() + View::VALID_COL_OFFSET;
@@ -182,9 +181,9 @@ View Views::nestedLoopJoin(View& v0, View& v1, std::string& field0, std::string&
         }
 
         const int baseTag = b * blockStride;
-        auto eqRes = equalOp(cmp0, cmp1, keyWidth, baseTag, bmts.nextBitwise(), JOIN_TASK_TAG);
-        auto pairValid = andOp(lval, rval, baseTag + eqStride, bmts.nextBitwise(), JOIN_TASK_TAG);
-        return andOp(eqRes, pairValid, baseTag + eqStride + andStride, bmts.nextBitwise(), JOIN_TASK_TAG);
+        auto eqRes = equalOp(cmp0, cmp1, keyWidth, baseTag, bmts.nextBitwise(), joinTask);
+        auto pairValid = andOp(lval, rval, baseTag + eqStride, bmts.nextBitwise(), joinTask);
+        return andOp(eqRes, pairValid, baseTag + eqStride + andStride, bmts.nextBitwise(), joinTask);
     });
     joined._dataCols[joined.colNum() + View::VALID_COL_OFFSET] = concat(std::move(valids));
 

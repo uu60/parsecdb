@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <climits>
 #include <cstdint>
+#include <future>
 #include <stdexcept>
 
 #include "parsecdb/ot/BaseOtBatchOperator.h"
@@ -36,6 +37,15 @@ bool backgroundGeneratorShouldStop(int taskTag) {
     Comm::wait(send);
     Comm::wait(receive);
     return localStop != 0 || peerStop != 0;
+}
+
+// Starts a background generator, which loops until shutdown. Without a worker pool, ThreadPoolSupport::submit would run
+// it on the calling thread and never return, so it gets a dedicated thread then.
+template <typename F> std::future<void> startGenerator(F&& generator) {
+    if (Conf::DISABLE_MULTI_THREAD) {
+        return std::async(std::launch::async, std::forward<F>(generator));
+    }
+    return ThreadPoolSupport::submit(std::forward<F>(generator));
 }
 
 } // namespace
@@ -259,7 +269,7 @@ std::vector<BitwiseBmt> IntermediateDataSupport::pollBitwiseBmts(int count, int 
 void IntermediateDataSupport::startGenerateBmtsAsync() {
     if (Comm::isServer() && Conf::BMT_METHOD == Conf::BMT_BACKGROUND) {
         for (int i = 0; i < Conf::BMT_QUEUE_NUM; i++) {
-            _generatorFutures.emplace_back(ThreadPoolSupport::submit([i] {
+            _generatorFutures.emplace_back(startGenerator([i] {
                 try {
                     auto q = _bmtQs[i];
                     const int taskTag = Conf::BMT_QUEUE_NUM + i;
@@ -280,7 +290,7 @@ void IntermediateDataSupport::startGenerateBmtsAsync() {
 void IntermediateDataSupport::startGenerateBitwiseBmtsAsync() {
     if (Conf::BMT_METHOD == Conf::BMT_BACKGROUND) {
         for (int i = 0; i < Conf::BMT_QUEUE_NUM; i++) {
-            _generatorFutures.emplace_back(ThreadPoolSupport::submit([i] {
+            _generatorFutures.emplace_back(startGenerator([i] {
                 try {
                     auto q = _bitwiseBmtQs[i];
                     while (!backgroundGeneratorShouldStop(i)) {

@@ -35,3 +35,24 @@ foreach (exp RANGE 1 8)
         set_property(TEST database.exp_${exp}.mpi.background PROPERTY ENVIRONMENT ${PARSEC_MPI_TEST_ENVIRONMENT})
     endif ()
 endforeach ()
+
+# Grouped aggregates checked against plaintext, with single-batch and multi-batch execution in one run.
+add_executable(correctness_db_aggregates ${CMAKE_CURRENT_SOURCE_DIR}/correctness_db_aggregates.cpp)
+target_link_libraries(correctness_db_aggregates PRIVATE parsecdb::db)
+foreach (variant IN ITEMS jit background background_single_thread)
+    set(args "")
+    if (variant STREQUAL "background")
+        set(args --bmt_method=bmt_background --disable_arith=false --max_bmts=10000)
+    elseif (variant STREQUAL "background_single_thread")
+        # Operators on one thread while the BMT generators run on their own threads.
+        set(args --bmt_method=bmt_background --disable_arith=false --max_bmts=10000 --disable_multi_thread=true)
+    endif ()
+    add_test(NAME database.aggregates.mpi.${variant}
+            COMMAND ${MPIEXEC_EXECUTABLE} ${PARSEC_MPIEXEC_TEST_FLAGS_LIST} ${MPIEXEC_NUMPROC_FLAG} 3
+                    ${MPIEXEC_PREFLAGS} $<TARGET_FILE:correctness_db_aggregates> ${args} ${MPIEXEC_POSTFLAGS})
+    set_tests_properties(database.aggregates.mpi.${variant} PROPERTIES
+            LABELS "correctness;database;mpi" PROCESSORS 3 TIMEOUT 180 FAIL_REGULAR_EXPRESSION "FAIL")
+    if (PARSEC_MPI_TEST_ENVIRONMENT)
+        set_property(TEST database.aggregates.mpi.${variant} PROPERTY ENVIRONMENT ${PARSEC_MPI_TEST_ENVIRONMENT})
+    endif ()
+endforeach ()

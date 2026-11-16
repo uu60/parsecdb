@@ -36,10 +36,6 @@ inline constexpr int NO_CLIENT = SecureOperator::NO_CLIENT_COMPUTE;
 // Otherwise every operator processes its whole input as one batch on the calling thread.
 inline bool multiBatchEnabled() { return Conf::BATCH_SIZE > 0 && !Conf::DISABLE_MULTI_THREAD; }
 
-// Whether an operator over n rows takes the parallel path with more rows than one batch holds. A few operators kept
-// behavior that differs between their former single-batch and multi-batch implementations; they test this.
-inline bool exceedsOneBatch(size_t n) { return multiBatchEnabled() && n > static_cast<size_t>(Conf::BATCH_SIZE); }
-
 // A split of the index range [0, total) into consecutive batches.
 struct BatchPlan {
     size_t total = 0;
