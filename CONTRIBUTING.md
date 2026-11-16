@@ -59,6 +59,28 @@ cmake --build --preset ci-sanitizers
 ASAN_OPTIONS=detect_leaks=0 ctest --preset ci-sanitizers
 ```
 
+### Full verification
+
+`tools/verify.py` builds everything and runs every correctness check, one line per check
+(`protocol  bool less [mpi] ........ OK`), then prints a summary and exits non-zero on any failure:
+
+1. all CTest tests (unit, protocol over MPI and TCP, database checks);
+2. `exp_1`..`exp_8` under the paper configurations (`parsec`, `parsec_base`, `parsec_noncompact`), fixed and
+   background BMTs (also single-threaded and with two queues), single-threaded and small-batch execution, and TCP;
+3. the Figure 4 JIT and background microbenchmarks on small inputs;
+4. with `--sanitizers`, the unit and protocol tests under ASan/UBSan.
+
+```bash
+tools/verify.py                 # full run, about 5 minutes on 12 cores
+tools/verify.py --quick         # CTest plus the paper configurations
+tools/verify.py --sanitizers    # also the sanitizer build
+tools/verify.py --skip-build --only matrix --build-dir build/dev
+```
+
+Logs of failed checks are written to `<build-dir>/verify-logs/`. Pass extra CMake arguments with `--cmake-arg`, for
+example `--cmake-arg=-DCMAKE_PREFIX_PATH=/opt/googletest`. Run it before opening a pull request that touches
+protocols, operators or the database layer.
+
 ## Pull requests
 
 Keep each pull request focused and include:

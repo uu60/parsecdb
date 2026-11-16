@@ -42,6 +42,10 @@ Until 1.0.0, minor versions may contain breaking API changes.
 
 ### Added
 
+- `tools/verify.py`: builds everything and runs every correctness check (all tests, the experiments under the paper
+  configurations, BMT modes, threading and batch sizes over MPI and TCP, the Figure 4 microbenchmarks, and optionally a
+  sanitizer build), printing one `name ........ OK` line per check and a summary.
+
 - `Dockerfile` for a reproducible build and test environment.
 - Unit tests that check the OT hash against a reference TCCR implementation.
 - Protocol correctness tests for arithmetic add, multiply, less-than and mux, Boolean AND, XOR, less-than and mux, and

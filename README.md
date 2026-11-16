@@ -52,6 +52,13 @@ cmake --build --preset ci
 ctest --preset ci
 ```
 
+To build everything and run every correctness check (all tests, the experiments under the paper configurations and
+BMT modes, and the Figure 4 microbenchmarks) with a one-line OK/FAIL report per check:
+
+```bash
+tools/verify.py
+```
+
 For a full release build including the database components and benchmarks:
 
 ```bash
