@@ -54,6 +54,11 @@ Depending on the selected operator and application flow, parties or the surround
 as message sizes, batch sizes, timing, operation order, table dimensions, process placement, and failure behavior.
 Parsec does not currently claim to hide all access patterns or traffic analysis information.
 
+Compaction (`View::clearInvalidEntries`, used by filters, joins and aggregations unless `--no_compaction=true` or
+`--baseline_mode=true`) opens the bit length of the number of valid rows and truncates the view to the smallest
+power-of-two prefix that holds them. The servers therefore learn the result size up to a factor of two, never the exact
+count; an earlier "precise compaction" mode that opened the exact count has been removed.
+
 Application code can also disclose values by reconstructing them to the wrong rank or by logging them. Review calls
 to reconstruction APIs and logging paths as part of every security-sensitive change.
 

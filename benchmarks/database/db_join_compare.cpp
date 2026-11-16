@@ -114,7 +114,6 @@ View nestedLoopJoinOldEqual(View& v0, View& v1, std::string& field0, std::string
     const int keyWidth = v0._fieldWidths[colIndex0];
 
     const bool baseline = DbConf::BASELINE_MODE;
-    const bool precise = (!DbConf::BASELINE_MODE) && (!DbConf::DISABLE_PRECISE_COMPACTION);
     const int validIdx0 = v0.colNum() + View::VALID_COL_OFFSET;
     const int validIdx1 = v1.colNum() + View::VALID_COL_OFFSET;
     const auto& lvalid = v0._dataCols[validIdx0];
@@ -127,12 +126,8 @@ View nestedLoopJoinOldEqual(View& v0, View& v1, std::string& field0, std::string
         std::vector<int64_t> cmp1;
         cmp0.reserve(n);
         cmp1.reserve(n);
-        std::vector<int64_t> bigLValid;
-        std::vector<int64_t> bigRValid;
-        if (!precise) {
-            bigLValid.resize(n);
-            bigRValid.resize(n);
-        }
+        std::vector<int64_t> bigLValid(n);
+        std::vector<int64_t> bigRValid(n);
 
         for (size_t i = 0; i < rows0; ++i) {
             for (size_t j = 0; j < rows1; ++j) {
@@ -144,28 +139,22 @@ View nestedLoopJoinOldEqual(View& v0, View& v1, std::string& field0, std::string
                 }
                 cmp0.push_back(col0[i]);
                 cmp1.push_back(col1[j]);
-                if (!precise) {
-                    bigLValid[rowIndex] = lvalid[i];
-                    bigRValid[rowIndex] = rvalid[j];
-                }
+                bigLValid[rowIndex] = lvalid[i];
+                bigRValid[rowIndex] = rvalid[j];
                 ++rowIndex;
             }
         }
 
         auto eqRes = oldEqual(&cmp0, &cmp1, keyWidth, 0, 0);
-        if (precise) {
-            joined._dataCols[joined.colNum() + View::VALID_COL_OFFSET] = std::move(eqRes);
-        } else {
-            auto pairValid = BoolAndBatchOperator(&bigLValid, &bigRValid, 1, 0, oldEqualTagStride(),
-                                                  SecureOperator::NO_CLIENT_COMPUTE)
-                                 .execute()
-                                 ->_zis;
-            joined._dataCols[joined.colNum() + View::VALID_COL_OFFSET] =
-                BoolAndBatchOperator(&eqRes, &pairValid, 1, 0, oldEqualTagStride() + BoolAndBatchOperator::tagStride(),
-                                     SecureOperator::NO_CLIENT_COMPUTE)
-                    .execute()
-                    ->_zis;
-        }
+        auto pairValid =
+            BoolAndBatchOperator(&bigLValid, &bigRValid, 1, 0, oldEqualTagStride(), SecureOperator::NO_CLIENT_COMPUTE)
+                .execute()
+                ->_zis;
+        joined._dataCols[joined.colNum() + View::VALID_COL_OFFSET] =
+            BoolAndBatchOperator(&eqRes, &pairValid, 1, 0, oldEqualTagStride() + BoolAndBatchOperator::tagStride(),
+                                 SecureOperator::NO_CLIENT_COMPUTE)
+                .execute()
+                ->_zis;
     } else {
         const int eqStride = oldEqualTagStride();
         const int andStride = BoolAndBatchOperator::tagStride();
@@ -179,11 +168,7 @@ View nestedLoopJoinOldEqual(View& v0, View& v1, std::string& field0, std::string
                 const size_t end = std::min(n, start + batchSize);
                 const size_t cnt = end - start;
                 std::vector<int64_t> cmp0(cnt), cmp1(cnt);
-                std::vector<int64_t> lval, rval;
-                if (!precise) {
-                    lval.resize(cnt);
-                    rval.resize(cnt);
-                }
+                std::vector<int64_t> lval(cnt), rval(cnt);
 
                 for (size_t off = 0; off < cnt; ++off) {
                     const size_t g = start + off;
@@ -191,17 +176,12 @@ View nestedLoopJoinOldEqual(View& v0, View& v1, std::string& field0, std::string
                     const size_t j = g % rows1;
                     cmp0[off] = col0[i];
                     cmp1[off] = col1[j];
-                    if (!precise) {
-                        lval[off] = lvalid[i];
-                        rval[off] = rvalid[j];
-                    }
+                    lval[off] = lvalid[i];
+                    rval[off] = rvalid[j];
                 }
 
                 const int baseTag = b * blockStride;
                 auto eqRes = oldEqual(&cmp0, &cmp1, keyWidth, 0, baseTag);
-                if (precise) {
-                    return eqRes;
-                }
 
                 auto pairValid =
                     BoolAndBatchOperator(&lval, &rval, 1, 0, baseTag + eqStride, SecureOperator::NO_CLIENT_COMPUTE)

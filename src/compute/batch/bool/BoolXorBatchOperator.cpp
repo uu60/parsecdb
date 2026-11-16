@@ -6,6 +6,9 @@
 namespace parsecdb {
 
 BoolXorBatchOperator* BoolXorBatchOperator::execute() {
+    if (Comm::isClient()) {
+        return this;
+    }
     if (Conf::ENABLE_SIMD) {
         _zis = SimdSupport::xorV(*_xis, *_yis);
     } else {

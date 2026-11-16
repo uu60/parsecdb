@@ -4,7 +4,6 @@
 #include "parsecdb/base/AbstractBatchOperator.h"
 #include "parsecdb/conf/Conf.h"
 #include "parsecdb/ot/RandOtBatchOperator.h"
-#include "parsecdb/ot/RandOtOperator.h"
 
 namespace parsecdb {
 

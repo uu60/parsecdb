@@ -5,7 +5,6 @@
 
 #include "parsecdb/comm/Comm.h"
 #include "parsecdb/compute/batch/bool/BoolLessBatchOperator.h"
-#include "parsecdb/compute/single/arith/ArithLessOperator.h"
 #include "parsecdb/secret/Secrets.h"
 #include "parsecdb/utils/Log.h"
 #include "parsecdb/utils/Math.h"

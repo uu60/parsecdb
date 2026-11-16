@@ -20,7 +20,9 @@
 
 #include "parsecdb/compute/batch/bool/BoolAndBatchOperator.h"
 #include "parsecdb/db/DbConf.h"
+#include "parsecdb/intermediate/IntermediateDataSupport.h"
 #include "parsecdb/utils/StringUtils.h"
+#include <memory>
 
 using namespace parsecdb;
 
@@ -117,7 +119,9 @@ int main(int argc, char* argv[]) {
         auto query_start = System::currentTimeMillis();
 
         View filtered_orders, filtered_lineitem;
-        if (DbConf::BASELINE_MODE) {
+        // With background BMTs the queue has one query-side consumer, so the two independent filters run in a fixed
+        // order; their internal batches still run in parallel.
+        if (DbConf::BASELINE_MODE || Conf::BMT_METHOD == Conf::BMT_BACKGROUND) {
             filtered_orders = filterOrdersByDate(orders_view, start_date, end_date, tid);
             filtered_lineitem = filterLineitemByCommitDate(lineitem_view, tid);
         } else {
@@ -248,17 +252,31 @@ View filterLineitemByCommitDate(View& lineitem_view, int tid) {
 
     std::vector<int64_t> comparison_result;
 
+    // This filter may run concurrently with filterOrdersByDate, so it uses its own task tag (an offset added to tid
+    // would be dropped by SecureOperator::buildTag).
+    const int lineitemTaskTag = 5;
     if (Conf::BATCH_SIZE <= 0 || Conf::DISABLE_MULTI_THREAD) {
-        comparison_result =
-            BoolLessBatchOperator(&commitdate_col, &receiptdate_col, 64, tid, 0, SecureOperator::NO_CLIENT_COMPUTE)
-                .execute()
-                ->_zis;
+        comparison_result = BoolLessBatchOperator(&commitdate_col, &receiptdate_col, 64, lineitemTaskTag, 0,
+                                                  SecureOperator::NO_CLIENT_COMPUTE)
+                                .execute()
+                                ->_zis;
     } else {
         size_t data_size = commitdate_col.size();
         int batchSize = Conf::BATCH_SIZE;
         int batchNum = (data_size + batchSize - 1) / batchSize;
 
         std::vector<std::future<std::vector<int64_t>>> batch_futures(batchNum);
+        // Background BMTs are taken for every batch on this thread before dispatch, so that both servers consume the
+        // queue in the same order.
+        std::vector<std::shared_ptr<std::vector<BitwiseBmt>>> batchBmts(batchNum);
+        if (Conf::BMT_METHOD == Conf::BMT_BACKGROUND) {
+            for (int b = 0; b < batchNum; ++b) {
+                const int start = b * batchSize;
+                const int end = std::min(start + batchSize, static_cast<int>(data_size));
+                batchBmts[b] = std::make_shared<std::vector<BitwiseBmt>>(
+                    IntermediateDataSupport::pollBitwiseBmts(BoolLessBatchOperator::bmtCount(end - start, 64), 64));
+            }
+        }
 
         for (int b = 0; b < batchNum; ++b) {
             batch_futures[b] = ThreadPoolSupport::submit([&, b]() -> std::vector<int64_t> {
@@ -268,11 +286,13 @@ View filterLineitemByCommitDate(View& lineitem_view, int tid) {
                 std::vector<int64_t> batch_commitdate(commitdate_col.begin() + start, commitdate_col.begin() + end);
                 std::vector<int64_t> batch_receiptdate(receiptdate_col.begin() + start, receiptdate_col.begin() + end);
 
-                int batch_tid = tid + b * BoolLessBatchOperator::tagStride();
-
-                return BoolLessBatchOperator(&batch_commitdate, &batch_receiptdate, 64, batch_tid, 0,
+                // Concurrent batches need distinct message ranges. An offset added to an encoded task tag is dropped
+                // by SecureOperator::buildTag, so use a dedicated task and put the offset in the message tag.
+                const int batchTag = b * BoolLessBatchOperator::tagStride();
+                return BoolLessBatchOperator(&batch_commitdate, &batch_receiptdate, 64, lineitemTaskTag, batchTag,
                                              SecureOperator::NO_CLIENT_COMPUTE)
-                    .execute()
+                    .setBmts(batchBmts[b].get())
+                    ->execute()
                     ->_zis;
             });
         }

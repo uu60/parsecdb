@@ -3,6 +3,7 @@
 
 #include <array>
 #include <cstdint>
+#include <future>
 #include <vector>
 
 #include "parsecdb/conf/Conf.h"
@@ -28,6 +29,8 @@ class IntermediateDataSupport {
   public:
     inline static std::vector<AbstractBlockingQueue<Bmt>*> _bmtQs;
     inline static std::vector<AbstractBlockingQueue<BitwiseBmt>*> _bitwiseBmtQs;
+    // Background BMT generator tasks, joined by finalize().
+    inline static std::vector<std::future<void>> _generatorFutures;
 
     inline static Bmt _fixedBmt;
     inline static BitwiseBmt _fixedBitwiseBmt;

@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <future>
+#include <memory>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -19,6 +20,7 @@
 
 #include "parsecdb/db/DbConf.h"
 #include "parsecdb/db/Table.h"
+#include "parsecdb/intermediate/IntermediateDataSupport.h"
 #include "parsecdb/parallel/ThreadPoolSupport.h"
 
 using namespace parsecdb;
@@ -235,7 +237,30 @@ View markAdjacentPairsWithinPid(View rcd_view, int tid) {
     const int strideLess64 = BoolLessBatchOperator::tagStride();
     const int strideEq64 = BoolEqualBatchOperator::tagStride();
     const int strideAnd1 = BoolAndBatchOperator::tagStride();
-    const int stridePerBatch = 2 * strideLess64 + 3 * strideEq64 + 5 * strideAnd1;
+    // Two less-than, three equality and six AND operators per batch.
+    const int stridePerBatch = 2 * strideLess64 + 3 * strideEq64 + 6 * strideAnd1;
+
+    // Background BMTs for every operator of every batch, taken on this thread before the batches run in parallel, so
+    // that both servers consume the queue in the same order. Each worker uses its batch's vectors in operator order.
+    using BitwiseBmtPtr = std::shared_ptr<std::vector<BitwiseBmt>>;
+    std::vector<std::vector<BitwiseBmtPtr>> bmtPlans(batches);
+    if (Conf::BMT_METHOD == Conf::BMT_BACKGROUND) {
+        auto take = [](int count) {
+            return std::make_shared<std::vector<BitwiseBmt>>(IntermediateDataSupport::pollBitwiseBmts(count, 64));
+        };
+        for (int b = 0; b < batches; ++b) {
+            const int start = b * B;
+            const int len = std::max(0, std::min(start + B, (int)n - 1) - start);
+            if (len == 0) {
+                continue;
+            }
+            const int less = BoolLessBatchOperator::bmtCount(len, 64);
+            const int equal = BoolEqualBatchOperator::bmtCount(len, 64);
+            const int andCount = BoolAndBatchOperator::bmtCount(len, 1);
+            bmtPlans[b] = {take(less),     take(equal), take(andCount), take(less),     take(equal),   take(andCount),
+                           take(andCount), take(equal), take(andCount), take(andCount), take(andCount)};
+        }
+    }
 
     auto workBatch = [&](int b) -> std::pair<int, std::vector<int64_t>> {
         const int start = b * B;
@@ -255,14 +280,24 @@ View markAdjacentPairsWithinPid(View rcd_view, int tid) {
         std::vector<int64_t> v_j(valid.begin() + start + 1, valid.begin() + endExclusive + 1);
 
         int bt = tid + b * stridePerBatch;
+        // The next operator's background BMTs, or null to let the operator obtain its own.
+        size_t nextPlan = 0;
+        auto bmts = [&]() { return bmtPlans[b].empty() ? nullptr : bmtPlans[b][nextPlan++].get(); };
 
-        auto lt_t15 = BoolLessBatchOperator(&t15_i, &t_j, 64, 0, bt, SecureOperator::NO_CLIENT_COMPUTE).execute()->_zis;
+        auto lt_t15 = BoolLessBatchOperator(&t15_i, &t_j, 64, 0, bt, SecureOperator::NO_CLIENT_COMPUTE)
+                          .setBmts(bmts())
+                          ->execute()
+                          ->_zis;
         bt += strideLess64;
-        auto eq_t15 =
-            BoolEqualBatchOperator(&t15_i, &t_j, 64, 0, bt, SecureOperator::NO_CLIENT_COMPUTE).execute()->_zis;
+        auto eq_t15 = BoolEqualBatchOperator(&t15_i, &t_j, 64, 0, bt, SecureOperator::NO_CLIENT_COMPUTE)
+                          .setBmts(bmts())
+                          ->execute()
+                          ->_zis;
         bt += strideEq64;
-        auto ltANDt15 =
-            BoolAndBatchOperator(&lt_t15, &eq_t15, 1, 0, bt, SecureOperator::NO_CLIENT_COMPUTE).execute()->_zis;
+        auto ltANDt15 = BoolAndBatchOperator(&lt_t15, &eq_t15, 1, 0, bt, SecureOperator::NO_CLIENT_COMPUTE)
+                            .setBmts(bmts())
+                            ->execute()
+                            ->_zis;
         bt += strideAnd1;
         std::vector<int64_t> ge15 = lt_t15;
         for (int k = 0; k < L; ++k)
@@ -270,12 +305,20 @@ View markAdjacentPairsWithinPid(View rcd_view, int tid) {
         for (int k = 0; k < L; ++k)
             ge15[k] ^= ltANDt15[k];
 
-        auto lt_56 = BoolLessBatchOperator(&t_j, &t56_i, 64, 0, bt, SecureOperator::NO_CLIENT_COMPUTE).execute()->_zis;
+        auto lt_56 = BoolLessBatchOperator(&t_j, &t56_i, 64, 0, bt, SecureOperator::NO_CLIENT_COMPUTE)
+                         .setBmts(bmts())
+                         ->execute()
+                         ->_zis;
         bt += strideLess64;
-        auto eq_56 = BoolEqualBatchOperator(&t_j, &t56_i, 64, 0, bt, SecureOperator::NO_CLIENT_COMPUTE).execute()->_zis;
+        auto eq_56 = BoolEqualBatchOperator(&t_j, &t56_i, 64, 0, bt, SecureOperator::NO_CLIENT_COMPUTE)
+                         .setBmts(bmts())
+                         ->execute()
+                         ->_zis;
         bt += strideEq64;
-        auto ltAND56 =
-            BoolAndBatchOperator(&lt_56, &eq_56, 1, 0, bt, SecureOperator::NO_CLIENT_COMPUTE).execute()->_zis;
+        auto ltAND56 = BoolAndBatchOperator(&lt_56, &eq_56, 1, 0, bt, SecureOperator::NO_CLIENT_COMPUTE)
+                           .setBmts(bmts())
+                           ->execute()
+                           ->_zis;
         bt += strideAnd1;
         std::vector<int64_t> le56 = lt_56;
         for (int k = 0; k < L; ++k)
@@ -283,19 +326,33 @@ View markAdjacentPairsWithinPid(View rcd_view, int tid) {
         for (int k = 0; k < L; ++k)
             le56[k] ^= ltAND56[k];
 
-        auto inrng = BoolAndBatchOperator(&ge15, &le56, 1, 0, bt, SecureOperator::NO_CLIENT_COMPUTE).execute()->_zis;
+        auto inrng = BoolAndBatchOperator(&ge15, &le56, 1, 0, bt, SecureOperator::NO_CLIENT_COMPUTE)
+                         .setBmts(bmts())
+                         ->execute()
+                         ->_zis;
         bt += strideAnd1;
 
-        auto samepid =
-            BoolEqualBatchOperator(&pid_i, &pid_j, 64, 0, bt, SecureOperator::NO_CLIENT_COMPUTE).execute()->_zis;
+        auto samepid = BoolEqualBatchOperator(&pid_i, &pid_j, 64, 0, bt, SecureOperator::NO_CLIENT_COMPUTE)
+                           .setBmts(bmts())
+                           ->execute()
+                           ->_zis;
         bt += strideEq64;
 
-        auto bothv = BoolAndBatchOperator(&v_i, &v_j, 1, 0, bt, SecureOperator::NO_CLIENT_COMPUTE).execute()->_zis;
+        auto bothv = BoolAndBatchOperator(&v_i, &v_j, 1, 0, bt, SecureOperator::NO_CLIENT_COMPUTE)
+                         .setBmts(bmts())
+                         ->execute()
+                         ->_zis;
         bt += strideAnd1;
 
-        auto hit1 = BoolAndBatchOperator(&inrng, &samepid, 1, 0, bt, SecureOperator::NO_CLIENT_COMPUTE).execute()->_zis;
+        auto hit1 = BoolAndBatchOperator(&inrng, &samepid, 1, 0, bt, SecureOperator::NO_CLIENT_COMPUTE)
+                        .setBmts(bmts())
+                        ->execute()
+                        ->_zis;
         bt += strideAnd1;
-        auto hit = BoolAndBatchOperator(&hit1, &bothv, 1, 0, bt, SecureOperator::NO_CLIENT_COMPUTE).execute()->_zis;
+        auto hit = BoolAndBatchOperator(&hit1, &bothv, 1, 0, bt, SecureOperator::NO_CLIENT_COMPUTE)
+                       .setBmts(bmts())
+                       ->execute()
+                       ->_zis;
 
         return {start, hit};
     };

@@ -1,10 +1,9 @@
-// Arithmetic-share addition and multiplication (Beaver triples), batch and single-value, over several ring widths.
+// Arithmetic-share addition and multiplication (Beaver triples) over several ring widths: the batch operators, and
+// ArithSecret::add / mul (one-element batches) on edge values.
 #include "ProtocolTestSupport.h"
 
 #include "parsecdb/compute/batch/arith/ArithAddBatchOperator.h"
 #include "parsecdb/compute/batch/arith/ArithMultiplyBatchOperator.h"
-#include "parsecdb/compute/single/arith/ArithAddOperator.h"
-#include "parsecdb/compute/single/arith/ArithMultiplyOperator.h"
 #include "parsecdb/utils/System.h"
 
 #include <array>
@@ -28,15 +27,20 @@ bool testBatch(const std::string& name, int width, int salt, int64_t (*plain)(in
     return checkResults(name, width, expected, op._results, &xs, &ys);
 }
 
-template <typename Op> bool testSingle(const std::string& name, int width, int64_t (*plain)(int64_t, int64_t, int)) {
+// ArithSecret::add / mul on one shared value each.
+bool testContainer(int width, int64_t (*plainAddFn)(int64_t, int64_t, int),
+                   int64_t (*plainMulFn)(int64_t, int64_t, int)) {
     bool passed = true;
-    const auto edges = edgeValues(width);
-    for (size_t i = 0; i < edges.size(); ++i) {
-        const int64_t x = edges[i];
-        const int64_t y = edges[(i * 3 + 1) % edges.size()];
-        Op op(x, y, width, System::nextTask(), 0, 2);
-        op.execute()->reconstruct(2);
-        passed = checkSingle(name, width, x, y, plain(x, y, width), op._result) && passed;
+    for (auto [x, y] : containerPairs(width)) {
+        const int task = System::nextTask();
+        const ArithSecret xs = shareArith(x, width, task);
+        const ArithSecret ys = shareArith(y, width, task);
+        passed =
+            checkSingle("ArithSecret::add", width, x, y, plainAddFn(x, y, width), xs.add(ys).reconstruct(2)._data) &&
+            passed;
+        passed =
+            checkSingle("ArithSecret::mul", width, x, y, plainMulFn(x, y, width), xs.mul(ys).reconstruct(2)._data) &&
+            passed;
     }
     return passed;
 }
@@ -53,13 +57,12 @@ int main(int argc, char** argv) {
     bool passed = true;
 
     int salt = 0;
-    for (int width : std::array<int, 7>{1, 2, 8, 16, 32, 63, 64}) {
+    for (int width : std::array<int, 7>{1, 2, 4, 8, 16, 32, 64}) {
         passed = testBatch<ArithAddBatchOperator>("ArithAdd batch", width, ++salt, plainAdd) && passed;
         passed = testBatch<ArithMultiplyBatchOperator>("ArithMultiply batch", width, ++salt, plainMultiply) && passed;
     }
-    for (int width : std::array<int, 3>{1, 8, 64}) {
-        passed = testSingle<ArithAddOperator>("ArithAdd single", width, plainAdd) && passed;
-        passed = testSingle<ArithMultiplyOperator>("ArithMultiply single", width, plainMultiply) && passed;
+    for (int width : std::array<int, 5>{1, 2, 8, 32, 64}) {
+        passed = testContainer(width, plainAdd, plainMultiply) && passed;
     }
 
     const int status = finish("ArithAddMultiply", passed);

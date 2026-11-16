@@ -248,7 +248,8 @@ int main(int argc, char* argv[]) {
         auto vCnt_copy = vCnt;
 
         View vHist, vZeros;
-        if (DbConf::BASELINE_MODE || DbConf::NO_COMPACTION) {
+        // With background BMTs the queue has one query-side consumer, so the two CTEs run one after the other.
+        if (DbConf::BASELINE_MODE || DbConf::NO_COMPACTION || Conf::BMT_METHOD == Conf::BMT_BACKGROUND) {
             vHist = createHistCTE(vCnt, tid);
 
             vZeros = createZerosCTE(vCustomer, vCnt_copy, tid);

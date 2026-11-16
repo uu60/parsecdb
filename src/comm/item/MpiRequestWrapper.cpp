@@ -2,7 +2,6 @@
 #include "parsecdb/comm/item/MpiRequestWrapper.h"
 
 #include "parsecdb/conf/Conf.h"
-#include "parsecdb/utils/Log.h"
 
 namespace parsecdb {
 
@@ -87,8 +86,6 @@ void MpiRequestWrapper::wait() {
             break;
         }
     }
-    if (Conf::BMT_METHOD == Conf::BMT_BACKGROUND)
-        Log::i("3");
 }
 
 } // namespace parsecdb

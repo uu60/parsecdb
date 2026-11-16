@@ -3,10 +3,8 @@
 
 #include "parsecdb/accelerate/SimdSupport.h"
 #include "parsecdb/compute/batch/bool/BoolAndBatchOperator.h"
-#include "parsecdb/compute/single/bool/BoolLessOperator.h"
 #include "parsecdb/conf/Conf.h"
 #include "parsecdb/intermediate/BitwiseBmtBatchGenerator.h"
-#include "parsecdb/intermediate/BitwiseBmtGenerator.h"
 #include "parsecdb/intermediate/IntermediateDataSupport.h"
 #include "parsecdb/parallel/ThreadPoolSupport.h"
 

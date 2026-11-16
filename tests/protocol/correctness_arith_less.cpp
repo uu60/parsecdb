@@ -2,15 +2,10 @@
 // bit, i.e. a signed comparison that is exact whenever x - y does not overflow the ring. The main cases therefore
 // draw signed operands from [-2^(w-2), 2^(w-2)); a second block probes overflowing pairs (such as min < max) and only
 // checks that the operator returns MSB(x - y), noting how often that differs from a true signed comparison.
-//
-// Known operator issue, skipped unless --known_bugs=a2b_single_narrow is given: the single-value ArithLessOperator goes
-// through ArithToBoolOperator, which reads three BitwiseBmt words from BitwiseBmtBatchGenerator(3, width) although that
-// generator packs 3 * width bits into ceil(3 * width / 64) words. For width < 64 (other than 1) it reads past the end
-// of the vector and returns wrong results, so by default the single-value case only runs at width 64.
+// ArithSecret::lessThan (a one-element batch) is checked on the in-range edge values.
 #include "ProtocolTestSupport.h"
 
 #include "parsecdb/compute/batch/arith/ArithLessBatchOperator.h"
-#include "parsecdb/compute/single/arith/ArithLessOperator.h"
 #include "parsecdb/utils/System.h"
 
 #include <array>
@@ -21,7 +16,7 @@ using namespace parsecdb::protocol_test;
 namespace {
 // Signed operands whose difference cannot overflow `width` bits, as ring elements.
 std::vector<int64_t> inRangeEdges(int width) {
-    const int64_t hi = (int64_t{1} << (width - 2)) - 1; // width >= 3, so the shift stays below 63
+    const int64_t hi = (int64_t{1} << (width - 2)) - 1; // 2 <= width <= 64, so the shift stays below 63
     const int64_t lo = -hi - 1;
     std::vector<int64_t> raw = {0, 1, -1, 2, -2, hi, hi - 1, lo, lo + 1};
     std::vector<int64_t> out;
@@ -98,16 +93,19 @@ bool testBatchOverflow(int width) {
     return checkResults("ArithLess batch (MSB of x - y, overflowing pairs)", width, expected, op._results, &xs, &ys);
 }
 
-bool testSingle(int width) {
+bool testContainer(int width) {
     bool passed = true;
     const auto edges = inRangeEdges(width);
     for (size_t i = 0; i < edges.size(); ++i) {
         const int64_t x = edges[i];
         const int64_t y = edges[(i * 4 + 2) % edges.size()];
-        for (auto [a, b] : std::array<std::pair<int64_t, int64_t>, 2>{{{x, y}, {x, x}}}) {
-            ArithLessOperator op(a, b, width, System::nextTask(), 0, 2);
-            op.execute()->reconstruct(2);
-            passed = checkSingle("ArithLess single", width, a, b, signedLess(a, b, width), op._result) && passed;
+        for (auto [a, b] : std::array<std::pair<int64_t, int64_t>, 3>{{{x, y}, {y, x}, {x, x}}}) {
+            const int task = System::nextTask();
+            const ArithSecret as = shareArith(a, width, task);
+            const ArithSecret bs = shareArith(b, width, task);
+            passed =
+                checkSingle("ArithSecret::lessThan", width, a, b, signedLess(a, b, width), openBit(as.lessThan(bs))) &&
+                passed;
         }
     }
     return passed;
@@ -119,15 +117,12 @@ int main(int argc, char** argv) {
     bool passed = true;
 
     int salt = 100;
-    for (int width : std::array<int, 6>{3, 8, 16, 32, 63, 64}) {
+    for (int width : std::array<int, 6>{2, 4, 8, 16, 32, 64}) {
         passed = testBatchInRange(width, ++salt) && passed;
         passed = testBatchOverflow(width) && passed;
     }
-    passed = testSingle(64) && passed;
-    if (knownBug("a2b_single_narrow")) {
-        for (int width : std::array<int, 2>{8, 32}) {
-            passed = testSingle(width) && passed;
-        }
+    for (int width : std::array<int, 5>{2, 4, 8, 32, 64}) {
+        passed = testContainer(width) && passed;
     }
 
     const int status = finish("ArithLess", passed);

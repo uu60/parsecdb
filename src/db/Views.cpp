@@ -1,28 +1,35 @@
-
 #include "parsecdb/db/Views.h"
 
-#include "parsecdb/comm/Comm.h"
-#include "parsecdb/compute/batch/arith/ArithAddBatchOperator.h"
-#include "parsecdb/compute/batch/arith/ArithLessBatchOperator.h"
-#include "parsecdb/compute/batch/bool/BoolEqualBatchOperator.h"
-#include "parsecdb/compute/batch/bool/BoolMutexBatchOperator.h"
-#include "parsecdb/compute/batch/bool/BoolToArithBatchOperator.h"
-#include "parsecdb/compute/batch/bool/BoolXorBatchOperator.h"
-#include "parsecdb/db/DbConf.h"
-#include "parsecdb/parallel/ThreadPoolSupport.h"
-#include "parsecdb/secret/Secrets.h"
-#include "parsecdb/utils/Log.h"
-#include "parsecdb/utils/Math.h"
-#include "parsecdb/utils/StringUtils.h"
 #include <algorithm>
 #include <cmath>
-#include <numeric>
-
+#include <sstream>
 #include <string>
 
-#include "parsecdb/compute/batch/bool/BoolAndBatchOperator.h"
+#include "Batching.h"
+#include "parsecdb/comm/Comm.h"
+#include "parsecdb/db/DbConf.h"
+#include "parsecdb/system/System.h"
+#include "parsecdb/utils/Log.h"
+#include "parsecdb/utils/Math.h"
+
+// Batched work follows the scheme described in View.cpp: planBatches() decides between parallel batches of
+// Conf::BATCH_SIZE and a single batch on the calling thread.
 
 namespace parsecdb {
+
+using namespace db;
+
+namespace {
+
+// Task tag of nestedLoopJoin()'s operators, whose message tags carry no task prefix: keeps them apart from the
+// background BMT generators, which own the lowest task tags.
+constexpr int JOIN_TASK_TAG = 4;
+
+// Message tag base, with the foreground task prefix, for the operators below that have no msgTagBase parameter.
+// A plain 0 would put their traffic in task 0, which belongs to a background BMT generator.
+int foregroundTagBase() { return System::nextTask() << (32 - Conf::TASK_TAG_BITS); }
+
+} // namespace
 
 View Views::selectAll(Table& t) {
     View v(t._tableName, t._fieldNames, t._fieldWidths);
@@ -128,142 +135,61 @@ View Views::nestedLoopJoin(View& v0, View& v1, std::string& field0, std::string&
     const int keyWidth = v0._fieldWidths[colIndex0];
 
     const bool BASELINE = DbConf::BASELINE_MODE;
-    const bool PRECISE = (!DbConf::BASELINE_MODE) && (!DbConf::DISABLE_PRECISE_COMPACTION);
 
     const int validIdx0 = v0.colNum() + View::VALID_COL_OFFSET;
     const int validIdx1 = v1.colNum() + View::VALID_COL_OFFSET;
     const auto& lvalid = v0._dataCols[validIdx0];
     const auto& rvalid = v1._dataCols[validIdx1];
 
-    const int batchSize = Conf::BATCH_SIZE;
-
-    if (DbConf::BASELINE_MODE || batchSize <= 0 || Conf::DISABLE_MULTI_THREAD) {
-        size_t rowIndex = 0;
-        std::vector<int64_t> cmp0;
-        cmp0.reserve(n);
-        std::vector<int64_t> cmp1;
-        cmp1.reserve(n);
-
-        std::vector<int64_t> bigLValid, bigRValid;
-        if (!PRECISE) {
-            bigLValid.resize(n);
-            bigRValid.resize(n);
-        }
-
-        for (size_t i = 0; i < rows0; ++i) {
-            for (size_t j = 0; j < rows1; ++j) {
-                for (size_t k = 0; k < effectiveFieldNum0; ++k)
-                    joined._dataCols[k][rowIndex] = v0._dataCols[k][i];
-                for (size_t k = 0; k < effectiveFieldNum1; ++k)
-                    joined._dataCols[k + effectiveFieldNum0][rowIndex] = v1._dataCols[k][j];
-
-                cmp0.push_back(col0[i]);
-                cmp1.push_back(col1[j]);
-
-                if (!PRECISE) {
-                    bigLValid[rowIndex] = lvalid[i];
-                    bigRValid[rowIndex] = rvalid[j];
-                }
-                ++rowIndex;
-            }
-        }
-
-        auto eqRes =
-            BoolEqualBatchOperator(&cmp0, &cmp1, keyWidth, 0, 0, SecureOperator::NO_CLIENT_COMPUTE).execute()->_zis;
-
-        std::vector<int64_t> outValid;
-        if (PRECISE) {
-            outValid = std::move(eqRes);
-        } else {
-            auto pairValid = BoolAndBatchOperator(&bigLValid, &bigRValid, 1, 0, BoolEqualBatchOperator::tagStride(),
-                                                  SecureOperator::NO_CLIENT_COMPUTE)
-                                 .execute()
-                                 ->_zis;
-            outValid = BoolAndBatchOperator(&eqRes, &pairValid, 1, 0,
-
-                                            BoolEqualBatchOperator::tagStride() + BoolAndBatchOperator::tagStride(),
-                                            SecureOperator::NO_CLIENT_COMPUTE)
-                           .execute()
-                           ->_zis;
-        }
-
-        joined._dataCols[joined.colNum() + View::VALID_COL_OFFSET] = std::move(outValid);
-    } else {
-        const int eqStride = BoolEqualBatchOperator::tagStride();
-        const int andStride = BoolAndBatchOperator::tagStride();
-        const int blockStride = eqStride + 2 * andStride;
-
-        const int batchNum = static_cast<int>((n + batchSize - 1) / batchSize);
-        std::vector<std::future<std::vector<int64_t>>> futures(batchNum);
-
-        for (int b = 0; b < batchNum; ++b) {
-            futures[b] = ThreadPoolSupport::submit([&, b]() {
-                const size_t start = static_cast<size_t>(b) * batchSize;
-                const size_t end = std::min(n, start + batchSize);
-                const size_t cnt = end - start;
-
-                std::vector<int64_t> cmp0(cnt), cmp1(cnt);
-                std::vector<int64_t> Lval, Rval;
-                if (!PRECISE) {
-                    Lval.resize(cnt);
-                    Rval.resize(cnt);
-                }
-
-                for (size_t off = 0; off < cnt; ++off) {
-                    const size_t g = start + off;
-                    const size_t i = g / rows1;
-                    const size_t j = g % rows1;
-                    cmp0[off] = col0[i];
-                    cmp1[off] = col1[j];
-                    if (!PRECISE) {
-                        Lval[off] = lvalid[i];
-                        Rval[off] = rvalid[j];
-                    }
-                }
-
-                const int baseTag = b * blockStride;
-                auto eqRes =
-                    BoolEqualBatchOperator(&cmp0, &cmp1, keyWidth, 0, baseTag, SecureOperator::NO_CLIENT_COMPUTE)
-                        .execute()
-                        ->_zis;
-
-                if (PRECISE) {
-                    return eqRes;
-                } else {
-                    auto pairValid =
-                        BoolAndBatchOperator(&Lval, &Rval, 1, 0, baseTag + eqStride, SecureOperator::NO_CLIENT_COMPUTE)
-                            .execute()
-                            ->_zis;
-                    return BoolAndBatchOperator(&eqRes, &pairValid, 1, 0, baseTag + eqStride + andStride,
-                                                SecureOperator::NO_CLIENT_COMPUTE)
-                        .execute()
-                        ->_zis;
-                }
-            });
-        }
-
-        size_t rowIndex = 0;
-        for (size_t i = 0; i < rows0; ++i) {
-            for (size_t j = 0; j < rows1; ++j) {
-                for (size_t k = 0; k < effectiveFieldNum0; ++k)
-                    joined._dataCols[k][rowIndex] = v0._dataCols[k][i];
-                for (size_t k = 0; k < effectiveFieldNum1; ++k)
-                    joined._dataCols[k + effectiveFieldNum0][rowIndex] = v1._dataCols[k][j];
-                ++rowIndex;
-            }
-        }
-
-        rowIndex = 0;
-        for (int b = 0; b < batchNum; ++b) {
-            auto r = futures[b].get();
-            for (size_t t = 0; t < r.size(); ++t) {
-                joined._dataCols[joined.colNum() + View::VALID_COL_OFFSET][rowIndex++] = r[t];
-            }
+    // Output row g joins row g / rows1 of v0 with row g % rows1 of v1.
+    size_t rowIndex = 0;
+    for (size_t i = 0; i < rows0; ++i) {
+        for (size_t j = 0; j < rows1; ++j) {
+            for (size_t k = 0; k < effectiveFieldNum0; ++k)
+                joined._dataCols[k][rowIndex] = v0._dataCols[k][i];
+            for (size_t k = 0; k < effectiveFieldNum1; ++k)
+                joined._dataCols[k + effectiveFieldNum0][rowIndex] = v1._dataCols[k][j];
+            ++rowIndex;
         }
     }
 
+    // Validity of each output row: keys equal and both input rows valid.
+    const int eqStride = BoolEqualBatchOperator::tagStride();
+    const int andStride = BoolAndBatchOperator::tagStride();
+    const int blockStride = eqStride + 2 * andStride;
+    const BatchPlan plan = planBatches(n);
+    auto prepare = [&](int, size_t begin, size_t end) {
+        BmtList bmts(prefetchBmts(plan.parallel));
+        const int cnt = static_cast<int>(end - begin);
+        bmts.addBitwise(BoolEqualBatchOperator::bmtCount(cnt, keyWidth));
+        bmts.addBitwise(BoolAndBatchOperator::bmtCount(cnt, 1));
+        bmts.addBitwise(BoolAndBatchOperator::bmtCount(cnt, 1));
+        return bmts;
+    };
+    auto valids = runBatches(plan, prepare, [&](int b, size_t begin, size_t end, BmtList& bmts) {
+        const size_t cnt = end - begin;
+        Shares cmp0(cnt), cmp1(cnt), lval(cnt), rval(cnt);
+        size_t i = begin / rows1, j = begin % rows1;
+        for (size_t off = 0; off < cnt; ++off) {
+            cmp0[off] = col0[i];
+            cmp1[off] = col1[j];
+            lval[off] = lvalid[i];
+            rval[off] = rvalid[j];
+            if (++j == rows1) {
+                j = 0;
+                ++i;
+            }
+        }
+
+        const int baseTag = b * blockStride;
+        auto eqRes = equalOp(cmp0, cmp1, keyWidth, baseTag, bmts.nextBitwise(), JOIN_TASK_TAG);
+        auto pairValid = andOp(lval, rval, baseTag + eqStride, bmts.nextBitwise(), JOIN_TASK_TAG);
+        return andOp(eqRes, pairValid, baseTag + eqStride + andStride, bmts.nextBitwise(), JOIN_TASK_TAG);
+    });
+    joined._dataCols[joined.colNum() + View::VALID_COL_OFFSET] = concat(std::move(valids));
+
     if (compress && !BASELINE) {
-        joined.clearInvalidEntries(0);
+        joined.clearInvalidEntries(foregroundTagBase());
     }
 
     return joined;
@@ -361,55 +287,32 @@ std::vector<std::vector<std::vector<int64_t>>> Views::butterflyPermutation(View&
             }
         }
 
+        // Routes every element by its bit: the first half of the result holds the lower bucket's new contents, the
+        // second half the upper bucket's.
         std::vector<int64_t> allResults;
-        if (Conf::DISABLE_MULTI_THREAD || Conf::BATCH_SIZE <= 0 || mergedDatas.size() <= Conf::BATCH_SIZE) {
-            allResults = BoolMutexBatchOperator(&mergedDatas, &dummyDatas, &routingBits, view._maxWidth, 0, msgTagBase)
-                             .execute()
-                             ->_zis;
+        const BatchPlan plan = planBatches(mergedDatas.size());
+        auto prepare = [&](int, size_t begin, size_t end) {
+            BmtList bmts(prefetchBmts(plan.parallel));
+            bmts.addBitwise(BoolMutexBatchOperator::bmtCount(static_cast<int>(end - begin), view._maxWidth));
+            return bmts;
+        };
+        auto parts = runBatches(plan, prepare, [&](int b, size_t begin, size_t end, BmtList& bmts) {
+            Shares bufData, bufDummy, bufRouting;
+            return mutexBothOp(*slice(mergedDatas, begin, end, bufData), *slice(dummyDatas, begin, end, bufDummy),
+                               *slice(routingBits, begin, end, bufRouting), view._maxWidth,
+                               msgTagBase + BoolMutexBatchOperator::tagStride() * b, bmts.nextBitwise());
+        });
+        if (parts.size() == 1) {
+            allResults = std::move(parts[0]);
         } else {
             const size_t totalCnt = mergedDatas.size();
-            const int batchSize = Conf::BATCH_SIZE;
-            const int numBatches = static_cast<int>((totalCnt + batchSize - 1) / batchSize);
-
             allResults.resize(totalCnt * 2);
-
-            const int tagStride = BoolMutexBatchOperator::tagStride();
-
-            std::vector<std::future<std::vector<int64_t>>> futures;
-            futures.reserve(numBatches);
-
-            for (int b = 0; b < numBatches; ++b) {
-                futures.emplace_back(ThreadPoolSupport::submit([&, b] {
-                    const size_t start = static_cast<size_t>(b) * batchSize;
-                    const size_t end = std::min(totalCnt, start + batchSize);
-                    const size_t cnt = end - start;
-
-                    std::vector<int64_t> subMerged(cnt);
-                    std::vector<int64_t> subDummy(cnt);
-                    std::vector<int64_t> subRouting(cnt);
-                    std::copy_n(mergedDatas.begin() + start, cnt, subMerged.begin());
-                    std::copy_n(dummyDatas.begin() + start, cnt, subDummy.begin());
-                    std::copy_n(routingBits.begin() + start, cnt, subRouting.begin());
-
-                    auto subResults = BoolMutexBatchOperator(&subMerged, &subDummy, &subRouting, view._maxWidth, 0,
-                                                             msgTagBase + tagStride * b)
-                                          .execute()
-                                          ->_zis;
-
-                    return subResults;
-                }));
-            }
-
             size_t frontPos = 0;
-            size_t backPos = totalCnt;
-            for (auto& f : futures) {
-                auto subResult = f.get();
-                int subHalf = subResult.size() / 2;
-                std::copy_n(subResult.begin(), subHalf, allResults.begin() + frontPos);
-                std::copy_n(subResult.begin() + subHalf, subHalf, allResults.begin() + backPos);
-
+            for (auto& part : parts) {
+                const size_t subHalf = part.size() / 2;
+                std::copy_n(part.begin(), subHalf, allResults.begin() + frontPos);
+                std::copy_n(part.begin() + subHalf, subHalf, allResults.begin() + totalCnt + frontPos);
                 frontPos += subHalf;
-                backPos += subHalf;
             }
         }
 
@@ -565,8 +468,8 @@ View Views::hashJoin(View& v0, View& v1, std::string& field0, std::string& field
     }
 
     std::vector<std::vector<std::vector<int64_t>>> buckets0, buckets1;
-    buckets0 = butterflyPermutation(v0, tagColIndex0, 0);
-    buckets1 = butterflyPermutation(v1, tagColIndex1, 0);
+    buckets0 = butterflyPermutation(v0, tagColIndex0, foregroundTagBase());
+    buckets1 = butterflyPermutation(v1, tagColIndex1, foregroundTagBase());
 
     for (int i = 0; i < numBuckets; i++) {
         if (!buckets0[i].empty() && !buckets1[i].empty() && !buckets0[i][0].empty() && !buckets1[i][0].empty()) {
@@ -639,7 +542,7 @@ View Views::leftOuterJoin(View& v0, View& v1, std::string& field0, std::string& 
     const int64_t MASK_ONE = Comm::rank();
     for (size_t i = 0; i < n0; ++i)
         not_has[i] = has_match[i] ^ MASK_ONE;
-    not_has = BoolAndBatchOperator(&not_has, const_cast<std::vector<int64_t>*>(&left_valid), 1, 0, 0,
+    not_has = BoolAndBatchOperator(&not_has, const_cast<std::vector<int64_t>*>(&left_valid), 1, 0, foregroundTagBase(),
                                    SecureOperator::NO_CLIENT_COMPUTE)
                   .execute()
                   ->_zis;
@@ -666,7 +569,7 @@ View Views::leftOuterJoin(View& v0, View& v1, std::string& field0, std::string& 
     }
 
     if (!DbConf::BASELINE_MODE && compress) {
-        left_only.clearInvalidEntries(0);
+        left_only.clearInvalidEntries(foregroundTagBase());
     }
 
     const size_t total_cols = joined.colNum();
@@ -687,11 +590,123 @@ int64_t Views::hash(int64_t keyValue) { return (keyValue * 31 + 17) % DbConf::SH
 
 std::vector<int64_t> Views::in(std::vector<int64_t>& col1, std::vector<int64_t>& col2, std::vector<int64_t>& left_valid,
                                std::vector<int64_t>& right_valid) {
-    if (Conf::BATCH_SIZE <= 0 || Conf::DISABLE_MULTI_THREAD) {
-        return inSingleBatch(col1, col2, left_valid, right_valid);
-    } else {
-        return inMultiBatches(col1, col2, left_valid, right_valid);
+    const size_t n = col1.size();
+    const size_t m = col2.size();
+    std::vector<int64_t> result(n, 0);
+    if (n == 0 || m == 0)
+        return result;
+
+    const int64_t rankShare = Comm::rank();
+    // The message tags below carry no task prefix; run them in the foreground task, apart from the background BMT
+    // generators, which own the lowest task tags.
+    const int taskTag = System::nextTask();
+
+    size_t cols = m;
+    int reduceRounds = 0;
+    while (cols > 1) {
+        cols = cols / 2 + (cols & 1);
+        ++reduceRounds;
     }
+
+    const int eqStride = BoolEqualBatchOperator::tagStride();
+    const int andStride = BoolAndBatchOperator::tagStride();
+
+    const bool maskRight = right_valid.size() == m;
+    if (!maskRight) {
+        Log::e("in: right_valid size mismatch: got {}, expect {}", right_valid.size(), m);
+    }
+
+    // Entry i * m + j of the n x m matrix holds NOT(col1[i] == col2[j] AND right_valid[j]).
+    const int eqBlockStride = eqStride + andStride;
+    const BatchPlan eqPlan = planBatches(n * m);
+    auto prepareEq = [&](int, size_t begin, size_t end) {
+        BmtList bmts(prefetchBmts(eqPlan.parallel));
+        const int cnt = static_cast<int>(end - begin);
+        bmts.addBitwise(BoolEqualBatchOperator::bmtCount(cnt, 64));
+        if (maskRight) {
+            bmts.addBitwise(BoolAndBatchOperator::bmtCount(cnt, 1));
+        }
+        return bmts;
+    };
+    std::vector<int64_t> cur =
+        concat(runBatches(eqPlan, prepareEq, [&](int b, size_t begin, size_t end, BmtList& bmts) {
+            const size_t cnt = end - begin;
+            Shares left(cnt), right(cnt), rv(maskRight ? cnt : 0);
+            size_t i = begin / m, j = begin % m;
+            for (size_t off = 0; off < cnt; ++off) {
+                left[off] = col1[i];
+                right[off] = col2[j];
+                if (maskRight) {
+                    rv[off] = right_valid[j];
+                }
+                if (++j == m) {
+                    j = 0;
+                    ++i;
+                }
+            }
+            const int eqTag = b * eqBlockStride;
+            auto eqRes = equalOp(left, right, 64, eqTag, bmts.nextBitwise(), taskTag);
+            if (maskRight) {
+                eqRes = andOp(eqRes, rv, eqTag + eqStride, bmts.nextBitwise(), taskTag);
+            }
+            flipBits(eqRes);
+            return eqRes;
+        }));
+
+    // AND-reduce every row pairwise; a row has a match iff not all of its entries are true.
+    const int reduceTagBase = eqPlan.numBatches * eqBlockStride;
+    size_t curCols = m;
+    int round = 0;
+    while (curCols > 1) {
+        const size_t pairsPerRow = curCols / 2;
+        const bool hasOdd = (curCols & 1);
+        const size_t totalPairs = n * pairsPerRow;
+
+        const BatchPlan plan = planBatches(totalPairs);
+        auto prepareAnd = [&](int, size_t begin, size_t end) {
+            BmtList bmts(prefetchBmts(plan.parallel));
+            bmts.addBitwise(BoolAndBatchOperator::bmtCount(static_cast<int>(end - begin), 1));
+            return bmts;
+        };
+        auto andOut = concat(runBatches(plan, prepareAnd, [&](int b, size_t begin, size_t end, BmtList& bmts) {
+            const size_t cnt = end - begin;
+            Shares andLeft(cnt), andRight(cnt);
+            for (size_t t = 0; t < cnt; ++t) {
+                const size_t g = begin + t;
+                const size_t base = (g / pairsPerRow) * curCols + 2 * (g % pairsPerRow);
+                andLeft[t] = cur[base];
+                andRight[t] = cur[base + 1];
+            }
+            return andOp(andLeft, andRight, reduceTagBase + (round + b) * andStride, bmts.nextBitwise(), taskTag);
+        }));
+
+        const size_t nextCols = pairsPerRow + (hasOdd ? 1 : 0);
+        std::vector<int64_t> next(n * nextCols);
+        size_t w = 0;
+        for (size_t i = 0; i < n; ++i) {
+            for (size_t p = 0; p < pairsPerRow; ++p) {
+                next[i * nextCols + p] = andOut[w++];
+            }
+            if (hasOdd) {
+                next[i * nextCols + pairsPerRow] = cur[i * curCols + (curCols - 1)];
+            }
+        }
+        cur.swap(next);
+        curCols = nextCols;
+        ++round;
+    }
+
+    for (size_t i = 0; i < n; ++i)
+        result[i] = cur[i] ^ rankShare;
+
+    if (left_valid.size() == n) {
+        const int finalMaskTag = eqPlan.numBatches * (eqStride + andStride) + reduceRounds * andStride;
+        result = andOp(result, left_valid, finalMaskTag, nullptr, taskTag);
+    } else {
+        Log::e("in: left_valid size mismatch: got {}, expect {}", left_valid.size(), n);
+    }
+
+    return result;
 }
 
 static std::string makeBorder(const std::vector<size_t>& w) {
@@ -718,16 +733,19 @@ void Views::revealAndPrint(View& v) {
     }
 
     const bool isSender = (Comm::rank() == 1);
+    // Direct Comm calls bypass SecureOperator::buildTag(): keep them out of the task tags of the background BMT
+    // generators, whose traffic a reveal on tag 0 could otherwise consume.
+    const int revealTagBase = System::nextTask() << (32 - Conf::TASK_TAG_BITS);
 
     std::vector<std::vector<int64_t>> plainCols(C);
     size_t nRows = 0;
 
     for (int i = 0; i < C; i++) {
         if (isSender) {
-            Comm::serverSend(v._dataCols[i], 64, 0);
+            Comm::serverSend(v._dataCols[i], 64, revealTagBase + i);
         } else {
             std::vector<int64_t> other;
-            Comm::serverReceive(other, 64, 0);
+            Comm::serverReceive(other, 64, revealTagBase + i);
             const auto& mine = v._dataCols[i];
             std::vector<int64_t> merged;
             merged.resize(mine.size());
@@ -777,306 +795,6 @@ void Views::revealAndPrint(View& v) {
     out << "(" << nRows << (nRows == 1 ? " row)" : " rows)") << '\n';
 
     Log::i("\n{}", out.str());
-}
-
-std::vector<int64_t> Views::inSingleBatch(std::vector<int64_t>& col1, std::vector<int64_t>& col2,
-                                          std::vector<int64_t>& left_valid, std::vector<int64_t>& right_valid) {
-    const size_t n = col1.size();
-    const size_t m = col2.size();
-    std::vector<int64_t> result(n, 0);
-    if (n == 0 || m == 0)
-        return result;
-
-    const int64_t rankShare = Comm::rank();
-
-    const bool PRECISE = (!DbConf::BASELINE_MODE) && (!DbConf::DISABLE_PRECISE_COMPACTION);
-
-    size_t cols = m;
-    int L = 0;
-    while (cols > 1) {
-        cols = cols / 2 + (cols & 1);
-        ++L;
-    }
-
-    const int eqStride = BoolEqualBatchOperator::tagStride();
-    const int andStride = BoolAndBatchOperator::tagStride();
-    const int tagStride = std::max(eqStride, andStride);
-
-    std::vector<int64_t> bigLeft(n * m), bigRight(n * m);
-    for (size_t i = 0; i < n; ++i) {
-        std::fill_n(bigLeft.begin() + i * m, m, col1[i]);
-        std::copy(col2.begin(), col2.end(), bigRight.begin() + i * m);
-    }
-    auto equal_all =
-        BoolEqualBatchOperator(&bigLeft, &bigRight, 64, 0, 0, SecureOperator::NO_CLIENT_COMPUTE).execute()->_zis;
-
-    if (!PRECISE) {
-        if (right_valid.size() != m) {
-            Log::e("inSingleBatch: right_valid size mismatch: got {}, expect {}", right_valid.size(), m);
-        } else {
-            std::vector<int64_t> bigRightValid(n * m);
-            for (size_t i = 0; i < n; ++i) {
-                std::copy(right_valid.begin(), right_valid.end(), bigRightValid.begin() + i * m);
-            }
-            equal_all = BoolAndBatchOperator(&equal_all, &bigRightValid, 1, 0, (L + 1) * tagStride,
-                                             SecureOperator::NO_CLIENT_COMPUTE)
-                            .execute()
-                            ->_zis;
-        }
-    }
-
-    for (auto& b : equal_all)
-        b ^= rankShare;
-    std::vector<int64_t> cur = std::move(equal_all);
-
-    cols = m;
-    int round = 0;
-    std::vector<int64_t> andLeft, andRight, next;
-
-    while (cols > 1) {
-        const size_t pairsPerRow = cols / 2;
-        const bool hasOdd = (cols & 1);
-        const size_t totalPairs = n * pairsPerRow;
-
-        andLeft.resize(totalPairs);
-        andRight.resize(totalPairs);
-
-        size_t w = 0;
-        for (size_t i = 0; i < n; ++i) {
-            const size_t base = i * cols;
-            for (size_t p = 0; p < pairsPerRow; ++p) {
-                andLeft[w] = cur[base + 2 * p];
-                andRight[w] = cur[base + 2 * p + 1];
-                ++w;
-            }
-        }
-
-        auto andOut =
-            BoolAndBatchOperator(&andLeft, &andRight, 1, 0, (round + 1) * tagStride, SecureOperator::NO_CLIENT_COMPUTE)
-                .execute()
-                ->_zis;
-
-        next.resize(n * (pairsPerRow + (hasOdd ? 1 : 0)));
-        w = 0;
-        for (size_t i = 0; i < n; ++i) {
-            const size_t nextBase = i * (pairsPerRow + (hasOdd ? 1 : 0));
-            for (size_t p = 0; p < pairsPerRow; ++p) {
-                next[nextBase + p] = andOut[w++];
-            }
-            if (hasOdd)
-                next[nextBase + pairsPerRow] = cur[i * cols + (cols - 1)];
-        }
-
-        cur.swap(next);
-        cols = pairsPerRow + (hasOdd ? 1 : 0);
-        ++round;
-    }
-
-    for (size_t i = 0; i < n; ++i)
-        result[i] = cur[i] ^ rankShare;
-
-    if (!PRECISE) {
-        if (left_valid.size() != n) {
-            Log::e("inSingleBatch: left_valid size mismatch: got {}, expect {}", left_valid.size(), n);
-        } else {
-            result =
-                BoolAndBatchOperator(&result, &left_valid, 1, 0, (L + 2) * tagStride, SecureOperator::NO_CLIENT_COMPUTE)
-                    .execute()
-                    ->_zis;
-        }
-    }
-
-    return result;
-}
-
-std::vector<int64_t> Views::inMultiBatches(std::vector<int64_t>& col1, std::vector<int64_t>& col2,
-                                           std::vector<int64_t>& left_valid, std::vector<int64_t>& right_valid) {
-    std::vector<int64_t> result(col1.size(), 0);
-    const size_t n = col1.size();
-    const size_t m = col2.size();
-    if (n == 0 || m == 0)
-        return result;
-
-    const int64_t rankShare = Comm::rank();
-    const size_t totalSize = n * m;
-    const int batchSize = Conf::BATCH_SIZE;
-    const int numBatches = (totalSize + batchSize - 1) / batchSize;
-
-    const bool PRECISE = (!DbConf::BASELINE_MODE) && (!DbConf::DISABLE_PRECISE_COMPACTION);
-
-    size_t cols = m;
-    int reduceRounds = 0;
-    while (cols > 1) {
-        cols = cols / 2 + (cols & 1);
-        ++reduceRounds;
-    }
-
-    const int equalTagStride = BoolEqualBatchOperator::tagStride();
-    const int andTagStride = BoolAndBatchOperator::tagStride();
-
-    std::vector<std::future<std::vector<int64_t>>> equalFutures(numBatches);
-
-    for (int b = 0; b < numBatches; ++b) {
-        equalFutures[b] = ThreadPoolSupport::submit([&, b]() {
-            const size_t start = static_cast<size_t>(b) * batchSize;
-            const size_t end = std::min(totalSize, start + batchSize);
-            const size_t cnt = end - start;
-
-            std::vector<int64_t> batchLeft(cnt), batchRight(cnt);
-
-            for (size_t idx = start; idx < end; ++idx) {
-                const size_t i = idx / m;
-                const size_t j = idx % m;
-                batchLeft[idx - start] = col1[i];
-                batchRight[idx - start] = col2[j];
-            }
-
-            const int eqTag = b * (equalTagStride + (PRECISE ? 0 : andTagStride));
-            auto eqRes =
-                BoolEqualBatchOperator(&batchLeft, &batchRight, 64, 0, eqTag, SecureOperator::NO_CLIENT_COMPUTE)
-                    .execute()
-                    ->_zis;
-
-            if (!PRECISE) {
-                if (right_valid.size() == m) {
-                    std::vector<int64_t> rv(cnt);
-                    for (size_t idx = start; idx < end; ++idx) {
-                        const size_t j = idx % m;
-                        rv[idx - start] = right_valid[j];
-                    }
-                    const int andTag = eqTag + equalTagStride;
-                    eqRes = BoolAndBatchOperator(&eqRes, &rv, 1, 0, andTag, SecureOperator::NO_CLIENT_COMPUTE)
-                                .execute()
-                                ->_zis;
-                } else {
-                    Log::e("inMultiBatches: right_valid size mismatch: got {}, expect {}", right_valid.size(), m);
-                }
-            }
-
-            for (auto& bit : eqRes)
-                bit ^= rankShare;
-            return eqRes;
-        });
-    }
-
-    std::vector<int64_t> cur;
-    cur.reserve(totalSize);
-    for (auto& f : equalFutures) {
-        auto part = f.get();
-        cur.insert(cur.end(), part.begin(), part.end());
-    }
-
-    size_t curCols = m;
-    int round = 0;
-
-    while (curCols > 1) {
-        const size_t pairsPerRow = curCols / 2;
-        const bool hasOdd = (curCols & 1);
-        const size_t totalPairs = n * pairsPerRow;
-
-        if (totalPairs == 0)
-            break;
-
-        if (totalPairs <= static_cast<size_t>(batchSize)) {
-            std::vector<int64_t> andLeft(totalPairs), andRight(totalPairs);
-
-            size_t w = 0;
-            for (size_t i = 0; i < n; ++i) {
-                const size_t base = i * curCols;
-                for (size_t p = 0; p < pairsPerRow; ++p) {
-                    andLeft[w] = cur[base + 2 * p];
-                    andRight[w] = cur[base + 2 * p + 1];
-                    ++w;
-                }
-            }
-
-            const int andBaseTag = numBatches * (equalTagStride + (PRECISE ? 0 : andTagStride)) + round * andTagStride;
-            auto andOut = BoolAndBatchOperator(&andLeft, &andRight, 1, 0, andBaseTag, SecureOperator::NO_CLIENT_COMPUTE)
-                              .execute()
-                              ->_zis;
-
-            std::vector<int64_t> next(n * (pairsPerRow + (hasOdd ? 1 : 0)));
-            w = 0;
-            for (size_t i = 0; i < n; ++i) {
-                const size_t nextBase = i * (pairsPerRow + (hasOdd ? 1 : 0));
-                for (size_t p = 0; p < pairsPerRow; ++p) {
-                    next[nextBase + p] = andOut[w++];
-                }
-                if (hasOdd) {
-                    next[nextBase + pairsPerRow] = cur[i * curCols + (curCols - 1)];
-                }
-            }
-            cur.swap(next);
-        } else {
-            const int andBatches = (totalPairs + batchSize - 1) / batchSize;
-            std::vector<std::future<std::vector<int64_t>>> andFuts(andBatches);
-
-            for (int b = 0; b < andBatches; ++b) {
-                andFuts[b] = ThreadPoolSupport::submit([&, b, round]() {
-                    const size_t start = static_cast<size_t>(b) * batchSize;
-                    const size_t end = std::min(totalPairs, start + batchSize);
-                    const size_t cnt = end - start;
-
-                    std::vector<int64_t> andLeft(cnt), andRight(cnt);
-
-                    size_t globalPairIdx = start;
-                    for (size_t t = 0; t < cnt; ++t, ++globalPairIdx) {
-                        size_t row = globalPairIdx / pairsPerRow;
-                        size_t p = globalPairIdx % pairsPerRow;
-                        const size_t base = row * curCols;
-                        andLeft[t] = cur[base + 2 * p];
-                        andRight[t] = cur[base + 2 * p + 1];
-                    }
-
-                    const int andTag = numBatches * (equalTagStride + (PRECISE ? 0 : andTagStride)) +
-                                       round * andTagStride + b * andTagStride;
-                    return BoolAndBatchOperator(&andLeft, &andRight, 1, 0, andTag, SecureOperator::NO_CLIENT_COMPUTE)
-                        .execute()
-                        ->_zis;
-                });
-            }
-
-            std::vector<int64_t> andOut;
-            andOut.reserve(totalPairs);
-            for (auto& f : andFuts) {
-                auto part = f.get();
-                andOut.insert(andOut.end(), part.begin(), part.end());
-            }
-
-            std::vector<int64_t> next(n * (pairsPerRow + (hasOdd ? 1 : 0)));
-            size_t w = 0;
-            for (size_t i = 0; i < n; ++i) {
-                const size_t nextBase = i * (pairsPerRow + (hasOdd ? 1 : 0));
-                for (size_t p = 0; p < pairsPerRow; ++p) {
-                    next[nextBase + p] = andOut[w++];
-                }
-                if (hasOdd) {
-                    next[nextBase + pairsPerRow] = cur[i * curCols + (curCols - 1)];
-                }
-            }
-            cur.swap(next);
-        }
-
-        curCols = pairsPerRow + (hasOdd ? 1 : 0);
-        ++round;
-    }
-
-    result.resize(n);
-    for (size_t i = 0; i < n; ++i)
-        result[i] = cur[i] ^ rankShare;
-
-    if (!PRECISE) {
-        if (left_valid.size() == n) {
-            const int finalMaskTag = numBatches * (equalTagStride + andTagStride) + reduceRounds * andTagStride;
-            result = BoolAndBatchOperator(&result, &left_valid, 1, 0, finalMaskTag, SecureOperator::NO_CLIENT_COMPUTE)
-                         .execute()
-                         ->_zis;
-        } else {
-            Log::e("inMultiBatches: left_valid size mismatch: got {}, expect {}", left_valid.size(), n);
-        }
-    }
-
-    return result;
 }
 
 void Views::addRedundantCols(View& v) {

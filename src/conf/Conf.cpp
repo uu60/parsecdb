@@ -18,9 +18,6 @@ Conf::BmtT parseBmtMethod(const std::string& value) {
     if (value == "bmt_fixed") {
         return Conf::BMT_FIXED;
     }
-    if (value == "bmt_pipeline") {
-        return Conf::BMT_PIPELINE;
-    }
     throw std::runtime_error("Unknown bmt_method value.");
 }
 
@@ -68,7 +65,7 @@ Conf::CommT parseCommType(const std::string& value) {
 void printHelp() {
     std::cout << "Allowed options:\n"
               << "  --help\n"
-              << "  --bmt_method=bmt_background|bmt_jit|bmt_fixed|bmt_pipeline\n"
+              << "  --bmt_method=bmt_background|bmt_jit|bmt_fixed\n"
               << "  --bmt_pre_gen_seconds=N\n"
               << "  --max_bmts=N\n"
               << "  --bmt_usage_limit=N\n"
@@ -93,8 +90,7 @@ void printHelp() {
               << "  --enable_hash_join=true|false\n"
               << "  --shuffle_bucket_num=N\n"
               << "  --baseline_mode=true|false\n"
-              << "  --no_compaction=true|false\n"
-              << "  --disable_precise_compaction=true|false\n";
+              << "  --no_compaction=true|false\n";
 }
 } // namespace
 

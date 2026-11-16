@@ -16,8 +16,18 @@ def run_cmd(cmd: List[str]) -> str:
     return p.stdout
 
 
+def executable_args(args: argparse.Namespace) -> List[str]:
+    params = ["--check=true", f"--bmt_method={args.bmt_method}"]
+    if args.bmt_method == "bmt_background":
+        # Background mode needs the arithmetic BMT queue as well as the bitwise one.
+        params.append("--disable_arith=false")
+    if args.max_bmts is not None:
+        params.append(f"--max_bmts={args.max_bmts}")
+    return params
+
+
 def run_mpi(args: argparse.Namespace, exe: str) -> str:
-    return run_cmd([args.mpirun, *shlex.split(args.mpirun_flags), "-np", "3", exe, "--check=true"])
+    return run_cmd([args.mpirun, *shlex.split(args.mpirun_flags), "-np", "3", exe, *executable_args(args)])
 
 
 def run_tcp(args: argparse.Namespace, exe: str) -> str:
@@ -29,7 +39,7 @@ def run_tcp(args: argparse.Namespace, exe: str) -> str:
         for rank in range(3):
             cmd = [
                 exe,
-                "--check=true",
+                *executable_args(args),
                 "--comm_type=tcp",
                 f"--tcp_rank={rank}",
                 f"--tcp_base_port={base_port}",
@@ -160,7 +170,7 @@ def check_experiment(args: argparse.Namespace, bin_dir: str) -> int:
         if val != 44:
             print(f"FAIL exp_7: got {val}, expected 44")
             return 1
-        print(f"PASS exp_7 [{args.comm}]")
+        print(f"PASS exp_7 [{args.comm}, {args.bmt_method}]")
         return 0
 
     got = sorted(set(parse_rows(out)))
@@ -171,7 +181,7 @@ def check_experiment(args: argparse.Namespace, bin_dir: str) -> int:
         print(f"expected: {exp}")
         return 1
 
-    print(f"PASS exp_{args.exp} [{args.comm}]")
+    print(f"PASS exp_{args.exp} [{args.comm}, {args.bmt_method}]")
     return 0
 
 
@@ -187,7 +197,11 @@ def main() -> int:
     ap.add_argument("--mpirun-flags", default="", help="extra launcher flags, for example --oversubscribe")
     ap.add_argument("--tcp-base-port", type=int, default=21000)
     ap.add_argument("--timeout", type=float, default=60.0)
+    ap.add_argument("--bmt-method", choices=["bmt_jit", "bmt_background", "bmt_fixed"], default="bmt_jit")
+    ap.add_argument("--max-bmts", type=int, help="BMT queue capacity in background mode")
     args = ap.parse_args()
+    if args.max_bmts is not None and args.max_bmts <= 0:
+        ap.error("--max-bmts must be positive")
 
     bin_dir = args.bin_dir or default_bin_dir()
     experiments = range(1, 9) if args.exp == "all" else [int(args.exp)]

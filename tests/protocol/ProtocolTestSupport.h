@@ -7,6 +7,9 @@
 
 #include "parsecdb/comm/Comm.h"
 #include "parsecdb/conf/AppConfig.h"
+#include "parsecdb/secret/item/ArithSecret.h"
+#include "parsecdb/secret/item/BitSecret.h"
+#include "parsecdb/secret/item/BoolSecret.h"
 #include "parsecdb/utils/Log.h"
 #include "parsecdb/utils/Math.h"
 
@@ -26,13 +29,6 @@ inline int randomCount() { return AppConfig::getInt("count", 1000); }
 inline std::mt19937_64 makeRng(int salt) {
     const auto seed = static_cast<uint64_t>(AppConfig::getInt("seed", 20261114));
     return std::mt19937_64(seed * 1000003ULL + static_cast<uint64_t>(salt));
-}
-
-// Cases that reproduce known operator bugs are skipped by default. --known_bugs=<id>[,<id>...] (or `all`) runs them;
-// CMakeLists.txt registers one such run per bug with WILL_FAIL, so it starts failing once the operator is fixed.
-inline bool knownBug(const std::string& id) {
-    const std::string list = "," + AppConfig::getString("known_bugs", "") + ",";
-    return list.find(",all,") != std::string::npos || list.find("," + id + ",") != std::string::npos;
 }
 
 inline uint64_t mask(int width) { return width >= 64 ? ~uint64_t{0} : (uint64_t{1} << width) - 1; }
@@ -101,26 +97,34 @@ inline void makePairs(std::mt19937_64& rng, int width, int count, std::vector<in
     }
 }
 
-// At most `n` pairs drawn from the edge values (every fourth pair equal). Used for batches that must stay small, such
-// as boolean batches whose width does not divide 64 (see the bool tests).
-inline void makeSmallPairs(int width, int n, std::vector<int64_t>& xs, std::vector<int64_t>& ys) {
-    xs.clear();
-    ys.clear();
+// Operand pairs for the one-element container checks: each edge value against another edge value, and against itself.
+inline std::vector<std::pair<int64_t, int64_t>> containerPairs(int width) {
     const auto edges = edgeValues(width);
-    for (int i = 0; i < n; ++i) {
-        const int64_t x = edges[i % edges.size()];
-        xs.push_back(x);
-        ys.push_back(i % 4 == 0 ? x : edges[(i * 3 + 1) % edges.size()]);
+    std::vector<std::pair<int64_t, int64_t>> out;
+    for (size_t i = 0; i < edges.size(); ++i) {
+        out.emplace_back(edges[i], edges[(i * 3 + 1) % edges.size()]);
+        out.emplace_back(edges[i], edges[i]);
     }
+    return out;
 }
 
-// Elements per batch for boolean operators at a width that does not divide 64: BoolAndBatchOperator packs its JIT
-// bitwise triples into 64-bit words and BitwiseBmt::extract throws once an element straddles two words, which cannot
-// happen while the whole batch fits in one word. `andsPerElement` is how many AND lanes the operator spends per
-// element (2 for the multiplexer).
-inline int oneWordBatch(int width, int andsPerElement = 1) { return 64 / (width * andsPerElement); }
+// Container helpers. Every container operation is called on all three ranks; the plaintext argument only matters on
+// the client, and reconstruct returns the plaintext on the client (0 on the servers).
+inline ArithSecret shareArith(int64_t x, int width, int task) { return ArithSecret(x, width, task, 0).share(2); }
 
-inline bool widthDivides64(int width) { return 64 % width == 0; }
+inline BoolSecret shareBool(int64_t x, int width, int task) { return BoolSecret(x, width, task, 0).share(2); }
+
+inline BitSecret shareBit(bool x, int task) { return BitSecret(x, task).share(2); }
+
+inline int64_t openArith(int64_t share, int width, int task) {
+    return ArithSecret(share, width, task, 0).reconstruct(2)._data;
+}
+
+inline int64_t openBool(int64_t share, int width, int task) {
+    return BoolSecret(share, width, task, 0).reconstruct(2)._data;
+}
+
+inline int64_t openBit(const BitSecret& bit) { return bit.reconstruct(2).get() ? 1 : 0; }
 
 // Compares reconstructed results on the client. Logs at most 10 mismatches per case.
 inline bool checkResults(const std::string& name, int width, const std::vector<int64_t>& expected,

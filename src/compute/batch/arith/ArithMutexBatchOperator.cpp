@@ -4,7 +4,6 @@
 #include "parsecdb/comm/Comm.h"
 #include "parsecdb/compute/batch/arith/ArithMultiplyBatchOperator.h"
 #include "parsecdb/compute/batch/bool/BoolToArithBatchOperator.h"
-#include "parsecdb/compute/single/bool/BoolToArithOperator.h"
 #include "parsecdb/conf/Conf.h"
 #include "parsecdb/intermediate/BmtBatchGenerator.h"
 #include "parsecdb/intermediate/IntermediateDataSupport.h"

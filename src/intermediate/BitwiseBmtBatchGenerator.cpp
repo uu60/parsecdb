@@ -2,7 +2,6 @@
 
 #include "parsecdb/conf/Conf.h"
 #include "parsecdb/ot/IknpOtBatchOperator.h"
-#include "parsecdb/ot/RandOtOperator.h"
 #include "parsecdb/parallel/ThreadPoolSupport.h"
 
 namespace parsecdb {

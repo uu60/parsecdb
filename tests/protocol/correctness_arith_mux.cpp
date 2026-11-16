@@ -1,9 +1,8 @@
 // Arithmetic-share multiplexer (ArithMutex*Operator): z = c ? x : y, with the condition bit shared by the client as
-// an arithmetic 0/1 value. Batch and single-value, over several ring widths.
+// an arithmetic 0/1 value, over several ring widths; plus ArithSecret::mux (one-element batches, BitSecret condition).
 #include "ProtocolTestSupport.h"
 
 #include "parsecdb/compute/batch/arith/ArithMutexBatchOperator.h"
-#include "parsecdb/compute/single/arith/ArithMutexOperator.h"
 #include "parsecdb/utils/System.h"
 
 #include <array>
@@ -37,18 +36,19 @@ bool testBatch(int width, int salt) {
     return checkResults("ArithMutex batch", width, expected, op._results, &xs, &ys, &cs);
 }
 
-bool testSingle(int width) {
+// ArithSecret::mux with a BitSecret condition: x.mux(y, c) = c ? x : y.
+bool testContainer(int width) {
     bool passed = true;
-    const auto edges = edgeValues(width);
-    for (size_t i = 0; i < edges.size(); ++i) {
-        const int64_t x = edges[i];
-        const int64_t y = edges[(i * 3 + 1) % edges.size()];
+    for (auto [x, y] : containerPairs(width)) {
         for (bool c : {false, true}) {
-            ArithMutexOperator op(x, y, c, width, System::nextTask(), 0, 2);
-            op.execute()->reconstruct(2);
-            if (Comm::isClient() && op._result != (c ? x : y)) {
-                Log::e("ArithMutex single width={} MISMATCH x={} y={} c={} expected={} got={}", width, x, y, c,
-                       c ? x : y, op._result);
+            const int task = System::nextTask();
+            const ArithSecret xs = shareArith(x, width, task);
+            const ArithSecret ys = shareArith(y, width, task);
+            const BitSecret cs = shareBit(c, task);
+            const int64_t got = xs.mux(ys, cs).reconstruct(2)._data;
+            if (Comm::isClient() && got != (c ? x : y)) {
+                Log::e("ArithSecret::mux width={} MISMATCH x={} y={} c={} expected={} got={}", width, x, y, c,
+                       c ? x : y, got);
                 passed = false;
             }
         }
@@ -62,11 +62,11 @@ int main(int argc, char** argv) {
     bool passed = true;
 
     int salt = 200;
-    for (int width : std::array<int, 6>{1, 2, 8, 32, 63, 64}) {
+    for (int width : std::array<int, 7>{1, 2, 4, 8, 16, 32, 64}) {
         passed = testBatch(width, ++salt) && passed;
     }
-    for (int width : std::array<int, 3>{1, 8, 64}) {
-        passed = testSingle(width) && passed;
+    for (int width : std::array<int, 5>{1, 2, 8, 32, 64}) {
+        passed = testContainer(width) && passed;
     }
 
     const int status = finish("ArithMutex", passed);

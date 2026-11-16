@@ -74,9 +74,9 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow and
 ## Features
 
 - Boolean-share and arithmetic-share MPC primitives.
-- Single-value and batch operators for `AND`, `XOR`, equality, less-than comparison, multiplexing, addition, multiplication, and share conversion.
+- Batch operators for `AND`, `XOR`, equality, less-than comparison, multiplexing, addition, multiplication, and share conversion.
 - Boolean and arithmetic secret containers with composable methods.
-- BMT generation modes: background, JIT, fixed, and pipeline.
+- BMT generation modes: background, JIT, and fixed.
 - OT support: elliptic-curve base OT (Chou-Orlandi over P-256), random OT, and IKNP OT extension with the TCCR
   fixed-key AES hash.
 - Communication abstraction with MPI and TCP implementations.
@@ -279,14 +279,14 @@ BMT options:
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `--bmt_method=bmt_background|bmt_jit|bmt_fixed|bmt_pipeline` | `bmt_jit` | BMT acquisition strategy |
+| `--bmt_method=bmt_background|bmt_jit|bmt_fixed` | `bmt_jit` | BMT acquisition strategy |
 | `--bmt_pre_gen_seconds=N` | `0` | Background pre-generation time |
-| `--max_bmts=N` | `INT_MAX` | Maximum BMT storage |
+| `--max_bmts=N` | `10000000` | Capacity of each background BMT queue |
 | `--bmt_usage_limit=N` | `1` | Reuse limit |
 | `--bmt_queue_type=cas_queue|lock_free_queue|lock_queue|spsc_queue` | `spsc_queue` | Queue implementation |
 | `--bmt_queue_num=N` | `1` | Number of BMT queues |
 | `--bmt_gen_batch_size=N` | `10000` | BMT generation batch size |
-| `--disable_arith=true|false` | `true` | Disable arithmetic BMT generation |
+| `--disable_arith=true|false` | `true` | Disable arithmetic BMT generation; set `false` with `bmt_background` |
 
 Database options:
 
@@ -296,7 +296,6 @@ Database options:
 | `--shuffle_bucket_num=N` | `32` | Number of shuffle buckets |
 | `--baseline_mode=true|false` | `false` | Disable optimizations for baseline runs |
 | `--no_compaction=true|false` | `false` | Disable compaction |
-| `--disable_precise_compaction=true|false` | `true` | Disable precise compaction |
 
 ## Core API
 
@@ -378,7 +377,8 @@ For `boolShare` and `arithShare`, the client rank passes plaintext input. Server
 
 ### Secret Object API
 
-`BoolSecret` and `ArithSecret` wrap one shared value and expose composable MPC operations.
+`BoolSecret`, `ArithSecret` and `BitSecret` wrap one shared value and expose composable MPC operations. Each method
+runs the corresponding batch operator on a one-element batch, so prefer the batch operators below for bulk work.
 
 ```cpp
 BoolSecret x(xShare, width, task, 0);
@@ -413,7 +413,8 @@ BoolSecret b = arithSecret.boolean();
 
 ### Batch Operator API
 
-Batch operators operate on `std::vector<int64_t>` shares. Constructors generally take:
+Batch operators operate on `std::vector<int64_t>` shares. Share widths must be powers of two from 1 to 64; other
+widths throw `std::invalid_argument`. Constructors generally take:
 
 ```text
 xs, ys, width, taskTag, msgTagOffset, clientRank
@@ -455,11 +456,8 @@ Most users should rely on JIT BMT generation through `--bmt_method=bmt_jit`, whi
 
 Explicit BMT generation is available through classes such as:
 
-- `BmtGenerator`
 - `BmtBatchGenerator`
-- `BitwiseBmtGenerator`
 - `BitwiseBmtBatchGenerator`
-- `PipelineBitwiseBmtBatchGenerator`
 
 Example:
 
@@ -469,7 +467,12 @@ gen.execute();
 auto &bmts = gen._bmts;
 ```
 
-Operators that accept pre-generated BMTs expose `setBmts(...)`.
+Operators that accept pre-generated BMTs expose `setBmts(...)` and a matching `bmtCount(...)`.
+
+With `--bmt_method=bmt_background`, BMTs come from queues filled by background generator threads; run with
+`--disable_arith=false` so the arithmetic queue exists, and use a bounded `--max_bmts` (for example 10000) for tests.
+Each queue has a single consumer, so code that runs operators in parallel must take every batch's BMTs on one thread,
+in a fixed order, and hand them to the operators with `setBmts(...)`.
 
 ### Database API
 
@@ -486,7 +489,7 @@ Use the `db_core` CMake target for direct C++ integration. Research experiments 
 ## Development Notes
 
 - The default BMT mode is JIT and is usually the easiest mode for parallel code.
-- Background and fixed BMT modes may require preserving BMT consumption order when operators are manually parallelized.
+- In background BMT mode, parallel operators must receive BMTs polled in a fixed order on one thread (see BMT API).
 - Message tags isolate parallel operator streams. Reusing tags across concurrent operators can cause incorrect receives.
 - Larger batches reduce communication overhead but increase memory usage.
 - `baseline_mode=true` intentionally disables several optimizations and is useful for controlled experiments.

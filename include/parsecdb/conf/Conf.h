@@ -28,14 +28,14 @@ class Conf {
 
     enum CommT { MPI, TCP };
 
-    enum BmtT { BMT_BACKGROUND, BMT_JIT, BMT_FIXED, BMT_PIPELINE };
+    enum BmtT { BMT_BACKGROUND, BMT_JIT, BMT_FIXED };
 
   public:
     static void init(int argc, char** argv);
 
     inline static BmtT BMT_METHOD = BMT_JIT;
     inline static int BMT_PRE_GEN_SECONDS = 0;
-    inline static int MAX_BMTS = INT_MAX;
+    inline static int MAX_BMTS = 10000000;
     inline static int BMT_USAGE_LIMIT = 1;
     inline static QueueT BMT_QUEUE_TYPE = SPSC_QUEUE;
     inline static int BMT_QUEUE_NUM = 1;
@@ -56,7 +56,7 @@ class Conf {
     inline static bool ENABLE_CLASS_WISE_TIMING = false;
 
     inline static bool ENABLE_SIMD = true;
-    inline static bool ENABLE_IKNP_MULTITHREAD = true;
+    inline static bool ENABLE_IKNP_MULTITHREAD = false;
 };
 
 } // namespace parsecdb

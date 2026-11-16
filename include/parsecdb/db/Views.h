@@ -39,12 +39,6 @@ class Views {
     static void revealAndPrint(View& v);
 
   private:
-    static std::vector<int64_t> inSingleBatch(std::vector<int64_t>& col1, std::vector<int64_t>& col2,
-                                              std::vector<int64_t>& left_valid, std::vector<int64_t>& right_valid);
-
-    static std::vector<int64_t> inMultiBatches(std::vector<int64_t>& col1, std::vector<int64_t>& col2,
-                                               std::vector<int64_t>& left_valid, std::vector<int64_t>& right_valid);
-
     static void addRedundantCols(View& v);
 
     static std::vector<std::vector<std::vector<int64_t>>> butterflyPermutation(View& view, int tagColIndex,

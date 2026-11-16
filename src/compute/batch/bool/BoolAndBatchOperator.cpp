@@ -4,7 +4,6 @@
 #include "parsecdb/accelerate/SimdSupport.h"
 #include "parsecdb/conf/Conf.h"
 #include "parsecdb/intermediate/BitwiseBmtBatchGenerator.h"
-#include "parsecdb/intermediate/BitwiseBmtGenerator.h"
 #include "parsecdb/intermediate/IntermediateDataSupport.h"
 #include "parsecdb/utils/Log.h"
 #include <mpi.h>
@@ -22,7 +21,7 @@ int BoolAndBatchOperator::prepareBmts(std::vector<BitwiseBmt>& bmts) {
     if (totalBits > 64) {
         bc = (totalBits + 63) / 64;
     }
-    if (Conf::BMT_METHOD == Conf::BMT_BACKGROUND || Conf::BMT_METHOD == Conf::BMT_PIPELINE) {
+    if (Conf::BMT_METHOD == Conf::BMT_BACKGROUND) {
         if (bc == -1) {
             bmts = IntermediateDataSupport::pollBitwiseBmts(1, totalBits);
         } else {

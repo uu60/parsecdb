@@ -4,6 +4,7 @@
 
 #include <future>
 
+#include "parsecdb/comm/Comm.h"
 #include "parsecdb/conf/Conf.h"
 #include "parsecdb/parallel/Async.h"
 #include "parsecdb/parallel/CtplThreadPool.h"
@@ -18,8 +19,10 @@ class ThreadPoolSupport {
     inline static Async* _async = nullptr;
 
   public:
+    // Requires Comm::init(): the client rank only supplies and reconstructs inputs and never runs server-side
+    // operators, so it gets no worker pool and submit() runs tasks on the calling thread.
     static void init() {
-        if (Conf::DISABLE_MULTI_THREAD) {
+        if (Conf::DISABLE_MULTI_THREAD || Comm::isClient()) {
             return;
         }
         if (Conf::THREAD_POOL_TYPE == Conf::CTPL_POOL) {
@@ -37,6 +40,9 @@ class ThreadPoolSupport {
         delete _ctplPool;
         delete _tbbPool;
         delete _async;
+        _ctplPool = nullptr;
+        _tbbPool = nullptr;
+        _async = nullptr;
     }
 
     template <typename F> static std::future<std::invoke_result_t<F>> callerRun(F&& f) {
@@ -56,15 +62,15 @@ class ThreadPoolSupport {
             return callerRun(f);
         }
         if (Conf::THREAD_POOL_TYPE == Conf::CTPL_POOL) {
-            return _ctplPool->submit(f);
+            return _ctplPool == nullptr ? callerRun(std::forward<F>(f)) : _ctplPool->submit(f);
         }
 #ifdef PARSEC_HAS_TBB
         if (Conf::THREAD_POOL_TYPE == Conf::TBB_POOL) {
-            return _tbbPool->submit(f);
+            return _tbbPool == nullptr ? callerRun(std::forward<F>(f)) : _tbbPool->submit(f);
         }
 #endif
         if (Conf::THREAD_POOL_TYPE == Conf::ASYNC) {
-            return _async->submit(f);
+            return _async == nullptr ? callerRun(std::forward<F>(f)) : _async->submit(f);
         }
         return callerRun(f);
     }

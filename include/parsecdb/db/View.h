@@ -3,10 +3,15 @@
 #define VIEW_H
 #include "parsecdb/db/Table.h"
 #include <cstdint>
-
+#include <functional>
 #include <string>
+#include <vector>
 
 namespace parsecdb {
+
+namespace db {
+class BmtList;
+}
 
 class View : public Table {
   public:
@@ -89,56 +94,44 @@ class View : public Table {
     int distinctTagStride();
 
   private:
-    void bitonicSortSingleBatch(const std::string& orderField, bool ascendingOrder, int msgTagBase);
+    // Polls, into the list, the BMTs that SwapBitsFn consumes for a batch of cnt compare-exchange pairs.
+    using PrepareSwapBitsFn = std::function<void(int cnt, db::BmtList& bmts)>;
 
-    void bitonicSortMultiBatches(const std::string& orderField, bool ascendingOrder, int msgTagBase);
+    // Computes the swap bit of the compare-exchange pairs [begin, end) of one bitonic step.
+    using SwapBitsFn = std::function<std::vector<int64_t>(const std::vector<int>& xIdx, const std::vector<int>& yIdx,
+                                                          const std::vector<bool>& dirs, size_t begin, size_t end,
+                                                          int msgTagBase, db::BmtList& bmts)>;
 
-    void bitonicSortSingleBatch(const std::vector<std::string>& orderFields, const std::vector<bool>& ascendingOrders,
-                                int msgTagBase);
-
-    void bitonicSortMultiBatches(const std::vector<std::string>& orderFields, const std::vector<bool>& ascendingOrders,
-                                 int msgTagBase);
-
-    void filterSingleBatch(std::vector<std::string>& fieldNames, std::vector<ComparatorType>& comparatorTypes,
-                           std::vector<int64_t>& constShares, bool clear, int msgTagBase);
-
-    void filterMultiBatches(std::vector<std::string>& fieldNames, std::vector<ComparatorType>& comparatorTypes,
-                            std::vector<int64_t>& constShares, bool clear, int msgTagBase);
+    // One aggregate of groupExtremes(): the running max or min of a column.
+    struct ExtremeSpec {
+        int srcIdx;
+        int width;
+        bool isMax;
+        std::string outName;
+    };
 
     void bitonicSort(const std::string& orderField, bool ascendingOrder, int msgTagBase);
 
     void bitonicSort(const std::vector<std::string>& orderFields, const std::vector<bool>& ascendingOrders,
                      int msgTagBase);
 
-    std::vector<int64_t> groupBySingleBatch(const std::string& groupField, int msgTagBase);
+    void bitonicNetwork(int batchTagStride, int msgTagBase, const PrepareSwapBitsFn& prepareSwapBits,
+                        const SwapBitsFn& swapBits);
 
-    std::vector<int64_t> groupByMultiBatches(const std::string& groupField, int msgTagBase);
+    void swapRows(const std::vector<int>& xIdx, const std::vector<int>& yIdx, size_t begin, size_t end,
+                  std::vector<int64_t>& swapBits, bool perColumn, int msgTagBase, db::BmtList& bmts);
 
-    std::vector<int64_t> groupBySingleBatch(const std::vector<std::string>& groupFields, int msgTagBase);
+    std::vector<int64_t> groupHeads(const std::vector<int>& groupCols, int tagOffset, int msgTagBase);
 
-    std::vector<int64_t> groupByMultiBatches(const std::vector<std::string>& groupFields, int msgTagBase);
+    std::vector<int64_t> groupTails(const std::vector<int64_t>& heads, int msgTagBase);
 
-    void countSingleBatch(std::vector<int64_t>& heads, std::string alias, int msgTagBase, std::string matchedTable,
-                          bool compress);
+    void applyGroupTails(int validIdx, std::vector<int64_t>& tails, bool compress, int msgTagBase);
 
-    void countMultiBatches(std::vector<int64_t>& heads, std::string alias, int msgTagBase, std::string matchedTable,
-                           bool compress);
+    void countSorted(std::vector<int64_t>& heads, const std::string& alias, const std::string& matchedTable,
+                     bool compress, int msgTagBase);
 
-    void maxSingleBatch(std::vector<int64_t>& heads, const std::string& fieldName, std::string alias, int msgTagBase);
-
-    void maxMultiBatches(std::vector<int64_t>& heads, const std::string& fieldName, std::string alias, int msgTagBase);
-
-    void minSingleBatch(std::vector<int64_t>& heads, const std::string& fieldName, std::string alias, int msgTagBase);
-
-    void minMultiBatches(std::vector<int64_t>& heads, const std::string& fieldName, std::string alias, int msgTagBase);
-
-    void minAndMaxSingleBatch(std::vector<int64_t>& heads, const std::string& minFieldName,
-                              const std::string& maxFieldName, std::string minAlias, std::string maxAlias,
-                              int msgTagBase);
-
-    void minAndMaxMultiBatches(std::vector<int64_t>& heads, const std::string& minFieldName,
-                               const std::string& maxFieldName, std::string minAlias, std::string maxAlias,
-                               int msgTagBase);
+    void groupExtremes(std::vector<int64_t>& heads, const std::vector<ExtremeSpec>& specs, bool legacyValidIdx,
+                       int msgTagBase);
 };
 
 } // namespace parsecdb

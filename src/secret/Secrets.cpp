@@ -1,225 +1,215 @@
-
 #include "parsecdb/secret/Secrets.h"
-#include <cmath>
 
-#include "parsecdb/accelerate/SimdSupport.h"
 #include "parsecdb/compute/batch/arith/ArithBatchOperator.h"
 #include "parsecdb/compute/batch/arith/ArithLessBatchOperator.h"
 #include "parsecdb/compute/batch/arith/ArithMutexBatchOperator.h"
+#include "parsecdb/compute/batch/bool/BoolBatchOperator.h"
 #include "parsecdb/compute/batch/bool/BoolLessBatchOperator.h"
 #include "parsecdb/compute/batch/bool/BoolMutexBatchOperator.h"
-#include "parsecdb/compute/single/bool/BoolMutexOperator.h"
 #include "parsecdb/conf/Conf.h"
 #include "parsecdb/intermediate/IntermediateDataSupport.h"
 #include "parsecdb/parallel/ThreadPoolSupport.h"
-#include "parsecdb/utils/Log.h"
+#include <algorithm>
+#include <future>
+#include <memory>
 
 namespace parsecdb {
 
-using BatchOutput = std::tuple<std::vector<int>, std::vector<int>, std::vector<int64_t>>;
+namespace {
 
-void bitonicSortBoolSingleBatch(std::vector<BoolSecret>& secrets, bool asc, int taskTag, int msgTagOffset) {
-    size_t n = secrets.size();
-    for (int k = 2; k <= n; k *= 2) {
-        for (int j = k / 2; j > 0; j /= 2) {
-            std::vector<int64_t> xs, ys;
-            std::vector<int> xIdx, yIdx;
-            std::vector<bool> ascs;
-            size_t halfN = n / 2;
-            xs.reserve(halfN);
-            ys.reserve(halfN);
-            xIdx.reserve(halfN);
-            yIdx.reserve(halfN);
-            ascs.reserve(halfN);
-
-            for (int i = 0; i < n; i++) {
-                int l = i ^ j;
-                if (l <= i) {
-                    continue;
-                }
-                bool dir = (i & k) == 0;
-                if (secrets[i]._padding && secrets[l]._padding) {
-                    continue;
-                }
-                if ((secrets[i]._padding && dir) || (secrets[l]._padding && !dir)) {
-                    std::swap(secrets[i], secrets[l]);
-                    continue;
-                }
-                if (secrets[i]._padding || secrets[l]._padding) {
-                    continue;
-                }
-                xs.push_back(secrets[i]._data);
-                xIdx.push_back(i);
-                ys.push_back(secrets[l]._data);
-                yIdx.push_back(l);
-                ascs.push_back(dir ^ !asc);
-            }
-
-            auto zs = BoolLessBatchOperator(&xs, &ys, secrets[0]._width, taskTag, msgTagOffset,
-                                            SecureOperator::NO_CLIENT_COMPUTE)
-                          .execute()
-                          ->_zis;
-
-            int comparingCount = static_cast<int>(xs.size());
-            for (int i = 0; i < comparingCount; i++) {
-                if (!ascs[i]) {
-                    zs[i] = zs[i] ^ Comm::rank();
-                }
-            }
-
-            zs = BoolMutexBatchOperator(&xs, &ys, &zs, secrets[0]._width, taskTag, msgTagOffset).execute()->_zis;
-
-            for (int i = 0; i < comparingCount; i++) {
-                secrets[xIdx[i]]._data = zs[i];
-                secrets[yIdx[i]]._data = zs[i + comparingCount];
-            }
+void flipDescending(std::vector<int64_t>& conds, const std::vector<bool>& ascs) {
+    for (size_t t = 0; t < ascs.size(); ++t) {
+        if (!ascs[t]) {
+            conds[t] ^= Comm::rank();
         }
     }
 }
 
-void bitonicSortBoolSplittedBatches(std::vector<BoolSecret>& secrets, bool asc, int taskTag, int msgTagOffset) {
-    int batchSize = Conf::BATCH_SIZE;
-    size_t n = secrets.size();
-    for (int k = 2; k <= n; k *= 2) {
-        for (int j = k / 2; j > 0; j /= 2) {
-            int comparingCount = 0;
-            for (int i = 0; i < n; ++i) {
-                int l = i ^ j;
+// Compare-and-swap of a batch of pairs (xs[t], ys[t]) for the Boolean and the arithmetic sharing. swap() returns 2n
+// values: the first n are the new values at the x positions, the last n the new values at the y positions. A pair is
+// put in ascending order when ascs[t] is true and in descending order otherwise.
+
+struct BoolCompareSwap {
+    using SecretT = BoolSecret;
+
+    // Bitwise BMTs for one batch, polled on the calling thread so that both servers consume the background queues in
+    // the same order regardless of thread scheduling. Empty unless BMTs are generated in the background.
+    struct Bmts {
+        std::vector<BitwiseBmt> less;
+        std::vector<BitwiseBmt> mux;
+    };
+
+    static int tagStride(int /*width*/) {
+        return std::max(BoolLessBatchOperator::tagStride(), BoolMutexBatchOperator::tagStride());
+    }
+
+    static std::shared_ptr<Bmts> pollBmts(size_t n, int width) {
+        auto bmts = std::make_shared<Bmts>();
+        if (Conf::BMT_METHOD == Conf::BMT_BACKGROUND) {
+            const int count = static_cast<int>(n);
+            bmts->less = IntermediateDataSupport::pollBitwiseBmts(BoolLessBatchOperator::bmtCount(count, width), 64);
+            bmts->mux = IntermediateDataSupport::pollBitwiseBmts(BoolMutexBatchOperator::bmtCount(count, width), 64);
+        }
+        return bmts;
+    }
+
+    static std::vector<int64_t> swap(std::vector<int64_t>& xs, std::vector<int64_t>& ys, const std::vector<bool>& ascs,
+                                     int width, int taskTag, int msgTag, Bmts& bmts) {
+        const bool background = Conf::BMT_METHOD == Conf::BMT_BACKGROUND;
+        auto conds = BoolLessBatchOperator(&xs, &ys, width, taskTag, msgTag, SecureOperator::NO_CLIENT_COMPUTE)
+                         .setBmts(background ? &bmts.less : nullptr)
+                         ->execute()
+                         ->_zis;
+        flipDescending(conds, ascs);
+        // The operator without a client rank is bidirectional: it returns (c ? x : y) followed by (c ? y : x).
+        return BoolMutexBatchOperator(&xs, &ys, &conds, width, taskTag, msgTag)
+            .setBmts(background ? &bmts.mux : nullptr)
+            ->execute()
+            ->_zis;
+    }
+};
+
+struct ArithCompareSwap {
+    using SecretT = ArithSecret;
+    struct Bmts {};
+
+    static int tagStride(int width) {
+        return std::max(ArithLessBatchOperator::tagStride(width), ArithMutexBatchOperator::tagStride(width));
+    }
+
+    static std::shared_ptr<Bmts> pollBmts(size_t /*n*/, int /*width*/) { return std::make_shared<Bmts>(); }
+
+    static std::vector<int64_t> swap(std::vector<int64_t>& xs, std::vector<int64_t>& ys, const std::vector<bool>& ascs,
+                                     int width, int taskTag, int msgTag, Bmts& /*bmts*/) {
+        auto conds =
+            ArithLessBatchOperator(&xs, &ys, width, taskTag, msgTag, SecureOperator::NO_CLIENT_COMPUTE).execute()->_zis;
+        flipDescending(conds, ascs);
+        // One mux over the concatenation computes both outputs: (c ? x : y) and (c ? y : x).
+        const size_t n = xs.size();
+        std::vector<int64_t> lhs, rhs, conds2;
+        lhs.reserve(2 * n);
+        rhs.reserve(2 * n);
+        conds2.reserve(2 * n);
+        lhs.insert(lhs.end(), xs.begin(), xs.end());
+        lhs.insert(lhs.end(), ys.begin(), ys.end());
+        rhs.insert(rhs.end(), ys.begin(), ys.end());
+        rhs.insert(rhs.end(), xs.begin(), xs.end());
+        conds2.insert(conds2.end(), conds.begin(), conds.end());
+        conds2.insert(conds2.end(), conds.begin(), conds.end());
+        return ArithMutexBatchOperator(&lhs, &rhs, &conds2, width, taskTag, msgTag, SecureOperator::NO_CLIENT_COMPUTE)
+            .execute()
+            ->_zis;
+    }
+};
+
+// A batch of the comparisons of one bitonic step.
+struct StepBatch {
+    std::vector<int64_t> xs, ys;
+    std::vector<int> xIdx, yIdx;
+    std::vector<bool> ascs;
+};
+
+// Bitonic sort over a power-of-two number of secrets; padding entries sort to the end. Each step's comparisons run as
+// one batch on the calling thread when multithreading is disabled, otherwise as batches of Conf::BATCH_SIZE on the
+// thread pool, each with its own message-tag range.
+template <class Ops> void bitonicSort(std::vector<typename Ops::SecretT>& secrets, bool asc, int taskTag) {
+    const size_t n = secrets.size();
+    // Only the servers hold shares; the operators return no results on the client.
+    if (n < 2 || !Comm::isServer()) {
+        return;
+    }
+    const int width = secrets[0]._width;
+    const bool parallel = Conf::BATCH_SIZE > 0 && !Conf::DISABLE_MULTI_THREAD;
+    const size_t batchSize = parallel ? static_cast<size_t>(Conf::BATCH_SIZE) : n;
+    const int tagStride = Ops::tagStride(width);
+
+    for (size_t k = 2; k <= n; k *= 2) {
+        for (size_t j = k / 2; j > 0; j /= 2) {
+            std::vector<StepBatch> batches;
+            for (size_t i = 0; i < n; ++i) {
+                const size_t l = i ^ j;
                 if (l <= i) {
                     continue;
                 }
-                bool dir = (i & k) == 0;
-                if (secrets[i]._padding && secrets[l]._padding)
-                    continue;
-                if ((secrets[i]._padding && dir) || (secrets[l]._padding && !dir)) {
-                    std::swap(secrets[i], secrets[l]);
-                    continue;
-                }
-                if (secrets[i]._padding || secrets[l]._padding)
-                    continue;
-                ++comparingCount;
-            }
-
-            int numBatches = (comparingCount + batchSize - 1) / batchSize;
-            std::vector<std::vector<int64_t>> xsBatches(numBatches), ysBatches(numBatches);
-            std::vector<std::vector<int>> xIdxBatches(numBatches), yIdxBatches(numBatches);
-            std::vector<std::vector<bool>> ascsBatches(numBatches);
-
-            for (int b = 0; b < numBatches; ++b) {
-                xsBatches[b].reserve(batchSize);
-                ysBatches[b].reserve(batchSize);
-                xIdxBatches[b].reserve(batchSize);
-                yIdxBatches[b].reserve(batchSize);
-                ascsBatches[b].reserve(batchSize);
-            }
-
-            int count = 0;
-            for (int i = 0; i < n; ++i) {
-                int l = i ^ j;
-                if (l <= i)
-                    continue;
-                bool dir = (i & k) == 0;
-                if (secrets[i]._padding && secrets[l]._padding)
-                    continue;
-                if ((secrets[i]._padding && dir) || (secrets[l]._padding && !dir)) {
+                const bool dir = (i & k) == 0;
+                auto& si = secrets[i];
+                auto& sl = secrets[l];
+                if (si._padding && sl._padding) {
                     continue;
                 }
-                if (secrets[i]._padding || secrets[l]._padding)
+                if ((si._padding && dir) || (sl._padding && !dir)) {
+                    std::swap(si, sl);
                     continue;
-
-                int b = count / batchSize;
-                xsBatches[b].push_back(secrets[i]._data);
-                ysBatches[b].push_back(secrets[l]._data);
-                xIdxBatches[b].push_back(i);
-                yIdxBatches[b].push_back(l);
-                ascsBatches[b].push_back(dir ^ !asc);
-                ++count;
+                }
+                if (si._padding || sl._padding) {
+                    continue;
+                }
+                if (batches.empty() || batches.back().xs.size() == batchSize) {
+                    batches.emplace_back();
+                }
+                auto& b = batches.back();
+                b.xs.push_back(si._data);
+                b.ys.push_back(sl._data);
+                b.xIdx.push_back(static_cast<int>(i));
+                b.yIdx.push_back(static_cast<int>(l));
+                b.ascs.push_back(dir ^ !asc);
             }
 
-            std::vector<std::future<BatchOutput>> futures;
-            futures.reserve(numBatches);
-
-            for (int b = 0; b < numBatches; ++b) {
-                std::shared_ptr<std::vector<BitwiseBmt>> bmtLessB, bmtMuxB;
-
-                if (Conf::BMT_METHOD == Conf::BMT_BACKGROUND) {
-                    bmtLessB = std::make_shared<std::vector<BitwiseBmt>>(IntermediateDataSupport::pollBitwiseBmts(
-                        BoolLessBatchOperator::bmtCount(xsBatches[b].size(), secrets[0]._width), 64));
-                    bmtMuxB = std::make_shared<std::vector<BitwiseBmt>>(IntermediateDataSupport::pollBitwiseBmts(
-                        2 * BoolMutexBatchOperator::bmtCount(xsBatches[b].size(), secrets[0]._width), 64));
+            auto apply = [&secrets](const StepBatch& b, const std::vector<int64_t>& zs) {
+                const size_t sz = b.xIdx.size();
+                for (size_t t = 0; t < sz; ++t) {
+                    secrets[b.xIdx[t]]._data = zs[t];
+                    secrets[b.yIdx[t]]._data = zs[t + sz];
                 }
+            };
 
-                futures.emplace_back(ThreadPoolSupport::submit([&, b, bmtLessB, bmtMuxB]() -> BatchOutput {
-                    auto& xsB = xsBatches[b];
-                    auto& ysB = ysBatches[b];
-                    auto& iB = xIdxBatches[b];
-                    auto& jB = yIdxBatches[b];
-                    auto& ascB = ascsBatches[b];
-                    int sz = static_cast<int>(xsB.size());
+            if (!parallel) {
+                for (auto& b : batches) {
+                    auto bmts = Ops::pollBmts(b.xs.size(), width);
+                    apply(b, Ops::swap(b.xs, b.ys, b.ascs, width, taskTag, 0, *bmts));
+                }
+                continue;
+            }
 
-                    int offset = std::max(BoolLessBatchOperator::tagStride(), BoolMutexBatchOperator::tagStride());
-
-                    auto zs1 = BoolLessBatchOperator(&xsB, &ysB, secrets[0]._width, taskTag, msgTagOffset + offset * b,
-                                                     SecureOperator::NO_CLIENT_COMPUTE)
-                                   .setBmts(Conf::BMT_METHOD == Conf::BMT_BACKGROUND ? bmtLessB.get() : nullptr)
-                                   ->execute()
-                                   ->_zis;
-
-                    for (int t = 0; t < sz; ++t) {
-                        if (!ascB[t]) {
-                            zs1[t] ^= Comm::rank();
-                        }
-                    }
-
-                    auto zs2 =
-                        BoolMutexBatchOperator(&xsB, &ysB, &zs1, secrets[0]._width, taskTag, msgTagOffset + offset * b)
-                            .setBmts(Conf::BMT_METHOD == Conf::BMT_BACKGROUND ? bmtMuxB.get() : nullptr)
-                            ->execute()
-                            ->_zis;
-
-                    return std::make_tuple(iB, jB, zs2);
+            std::vector<std::future<std::vector<int64_t>>> futures;
+            futures.reserve(batches.size());
+            for (size_t bi = 0; bi < batches.size(); ++bi) {
+                auto bmts = Ops::pollBmts(batches[bi].xs.size(), width);
+                futures.emplace_back(ThreadPoolSupport::submit([&batches, bi, bmts, width, taskTag, tagStride] {
+                    auto& b = batches[bi];
+                    return Ops::swap(b.xs, b.ys, b.ascs, width, taskTag, static_cast<int>(bi) * tagStride, *bmts);
                 }));
             }
-
-            for (auto& fut : futures) {
-                auto [iB, jB, zs2] = fut.get();
-                int sz = static_cast<int>(iB.size());
-                for (int t = 0; t < sz; ++t) {
-                    secrets[iB[t]]._data = zs2[t];
-                    secrets[jB[t]]._data = zs2[t + sz];
-                }
+            for (size_t bi = 0; bi < batches.size(); ++bi) {
+                apply(batches[bi], futures[bi].get());
             }
         }
     }
 }
 
-void bitonicSortBool(std::vector<BoolSecret>& secrets, bool asc, int taskTag, int msgTagOffset) {
-    if (Conf::BATCH_SIZE <= 0 || Conf::DISABLE_MULTI_THREAD) {
-        bitonicSortBoolSingleBatch(secrets, asc, taskTag, msgTagOffset);
-    } else {
-        bitonicSortBoolSplittedBatches(secrets, asc, taskTag, msgTagOffset);
+// Pads to the next power of two with padding entries, sorts, and removes the padding again.
+template <class Ops> void sortPadded(std::vector<typename Ops::SecretT>& secrets, bool asc, int taskTag) {
+    const size_t n = secrets.size();
+    size_t padded = 1;
+    while (padded < n) {
+        padded <<= 1;
     }
+    typename Ops::SecretT padding;
+    padding._padding = true;
+    secrets.resize(padded, padding);
+    bitonicSort<Ops>(secrets, asc, taskTag);
+    secrets.resize(n);
 }
 
-void doSort(std::vector<BoolSecret>& secrets, bool asc, int taskTag) {
-    size_t n = secrets.size();
-    bool isPowerOf2 = (n > 0) && ((n & (n - 1)) == 0);
-    size_t paddingCount = 0;
-    if (!isPowerOf2) {
-        BoolSecret p;
-        p._padding = true;
+} // namespace
 
-        size_t nextPow2 = static_cast<size_t>(1) << static_cast<size_t>(std::ceil(std::log2(n)));
-        secrets.resize(nextPow2, p);
-        paddingCount = nextPow2 - n;
-    }
-    bitonicSortBool(secrets, asc, taskTag, 0);
-    if (paddingCount > 0) {
-        secrets.resize(secrets.size() - paddingCount);
-    }
+void Secrets::sort(std::vector<BoolSecret>& secrets, bool asc, int taskTag) {
+    sortPadded<BoolCompareSwap>(secrets, asc, taskTag);
 }
 
-void Secrets::sort(std::vector<BoolSecret>& secrets, bool asc, int taskTag) { doSort(secrets, asc, taskTag); }
+void Secrets::sort(std::vector<ArithSecret>& secrets, bool asc, int taskTag) {
+    sortPadded<ArithCompareSwap>(secrets, asc, taskTag);
+}
 
 std::vector<int64_t> Secrets::boolShare(std::vector<int64_t>& origins, int clientRank, int width, int taskTag) {
     return BoolBatchOperator(origins, width, taskTag, 0, clientRank)._zis;
@@ -240,217 +230,5 @@ std::vector<int64_t> Secrets::arithReconstruct(std::vector<int64_t>& secrets, in
         .reconstruct(clientRank)
         ->_results;
 }
-
-void bitonicSortArithSingleBatch(std::vector<ArithSecret>& secrets, bool asc, int taskTag, int msgTagOffset) {
-    size_t n = secrets.size();
-    for (int k = 2; k <= n; k *= 2) {
-        for (int j = k / 2; j > 0; j /= 2) {
-            std::vector<int64_t> xs, ys;
-            std::vector<int> xIdx, yIdx;
-            std::vector<bool> ascs;
-            size_t halfN = n / 2;
-            xs.reserve(halfN);
-            ys.reserve(halfN);
-            xIdx.reserve(halfN);
-            yIdx.reserve(halfN);
-            ascs.reserve(halfN);
-
-            for (int i = 0; i < n; i++) {
-                int l = i ^ j;
-                if (l <= i) {
-                    continue;
-                }
-                bool dir = (i & k) == 0;
-                if (secrets[i]._padding && secrets[l]._padding) {
-                    continue;
-                }
-                if ((secrets[i]._padding && dir) || (secrets[l]._padding && !dir)) {
-                    std::swap(secrets[i], secrets[l]);
-                    continue;
-                }
-                if (secrets[i]._padding || secrets[l]._padding) {
-                    continue;
-                }
-                xs.push_back(secrets[i]._data);
-                xIdx.push_back(i);
-                ys.push_back(secrets[l]._data);
-                yIdx.push_back(l);
-                ascs.push_back(dir ^ !asc);
-            }
-
-            auto zs = ArithLessBatchOperator(&xs, &ys, secrets[0]._width, taskTag, msgTagOffset,
-                                             SecureOperator::NO_CLIENT_COMPUTE)
-                          .execute()
-                          ->_zis;
-
-            int comparingCount = static_cast<int>(xs.size());
-            for (int i = 0; i < comparingCount; i++) {
-                if (!ascs[i]) {
-                    zs[i] = zs[i] ^ Comm::rank();
-                }
-            }
-
-            size_t concatSize = xs.size() + ys.size();
-            xs.reserve(concatSize);
-            ys.reserve(concatSize);
-            zs.reserve(concatSize);
-            auto bk = xs.end();
-            xs.insert(xs.end(), ys.begin(), ys.end());
-            ys.insert(ys.end(), xs.begin(), bk);
-            zs.insert(zs.end(), zs.begin(), zs.end());
-            zs = ArithMutexBatchOperator(&xs, &ys, &zs, secrets[0]._width, taskTag, msgTagOffset,
-                                         SecureOperator::NO_CLIENT_COMPUTE)
-                     .execute()
-                     ->_zis;
-
-            for (int i = 0; i < comparingCount; i++) {
-                secrets[xIdx[i]]._data = zs[i];
-                secrets[yIdx[i]]._data = zs[i + comparingCount];
-            }
-        }
-    }
-}
-
-void bitonicSortArithSplittedBatches(std::vector<ArithSecret>& secrets, bool asc, int taskTag, int msgTagOffset) {
-    int batchSize = Conf::BATCH_SIZE;
-    size_t n = secrets.size();
-    for (int k = 2; k <= n; k *= 2) {
-        for (int j = k / 2; j > 0; j /= 2) {
-            int comparingCount = 0;
-            for (int i = 0; i < n; ++i) {
-                int l = i ^ j;
-                if (l <= i) {
-                    continue;
-                }
-                bool dir = (i & k) == 0;
-                if (secrets[i]._padding && secrets[l]._padding)
-                    continue;
-                if ((secrets[i]._padding && dir) || (secrets[l]._padding && !dir)) {
-                    std::swap(secrets[i], secrets[l]);
-                    continue;
-                }
-                if (secrets[i]._padding || secrets[l]._padding)
-                    continue;
-                ++comparingCount;
-            }
-
-            int numBatches = (comparingCount + batchSize - 1) / batchSize;
-            std::vector<std::vector<int64_t>> xsBatches(numBatches), ysBatches(numBatches);
-            std::vector<std::vector<int>> xIdxBatches(numBatches), yIdxBatches(numBatches);
-            std::vector<std::vector<bool>> ascsBatches(numBatches);
-
-            for (int b = 0; b < numBatches; ++b) {
-                xsBatches[b].reserve(batchSize);
-                ysBatches[b].reserve(batchSize);
-                xIdxBatches[b].reserve(batchSize);
-                yIdxBatches[b].reserve(batchSize);
-                ascsBatches[b].reserve(batchSize);
-            }
-
-            int count = 0;
-            for (int i = 0; i < n; ++i) {
-                int l = i ^ j;
-                if (l <= i)
-                    continue;
-                bool dir = (i & k) == 0;
-                if (secrets[i]._padding && secrets[l]._padding)
-                    continue;
-                if ((secrets[i]._padding && dir) || (secrets[l]._padding && !dir)) {
-                    continue;
-                }
-                if (secrets[i]._padding || secrets[l]._padding)
-                    continue;
-
-                int b = count / batchSize;
-                xsBatches[b].push_back(secrets[i]._data);
-                ysBatches[b].push_back(secrets[l]._data);
-                xIdxBatches[b].push_back(i);
-                yIdxBatches[b].push_back(l);
-                ascsBatches[b].push_back(dir ^ !asc);
-                ++count;
-            }
-
-            std::vector<std::future<BatchOutput>> futures;
-            futures.reserve(numBatches);
-
-            for (int b = 0; b < numBatches; ++b) {
-                futures.emplace_back(ThreadPoolSupport::submit([&, b]() -> BatchOutput {
-                    auto& xsB = xsBatches[b];
-                    auto& ysB = ysBatches[b];
-                    auto& iB = xIdxBatches[b];
-                    auto& jB = yIdxBatches[b];
-                    auto& ascB = ascsBatches[b];
-                    int sz = static_cast<int>(xsB.size());
-
-                    int offset = std::max(ArithLessBatchOperator::tagStride(secrets[0]._width),
-                                          ArithMutexBatchOperator::tagStride(secrets[0]._width));
-
-                    auto zs1 = ArithLessBatchOperator(&xsB, &ysB, secrets[0]._width, taskTag, msgTagOffset + offset * b,
-                                                      SecureOperator::NO_CLIENT_COMPUTE)
-                                   .execute()
-                                   ->_zis;
-
-                    for (int t = 0; t < sz; ++t) {
-                        if (!ascB[t]) {
-                            zs1[t] ^= Comm::rank();
-                        }
-                    }
-
-                    size_t concatSize = xsB.size() + ysB.size();
-                    xsB.reserve(concatSize);
-                    ysB.reserve(concatSize);
-                    zs1.reserve(concatSize);
-                    auto bk = xsB.end();
-                    xsB.insert(xsB.end(), ysB.begin(), ysB.end());
-                    ysB.insert(ysB.end(), xsB.begin(), bk);
-                    zs1.insert(zs1.end(), zs1.begin(), zs1.end());
-                    auto zs2 = ArithMutexBatchOperator(&xsB, &ysB, &zs1, secrets[0]._width, taskTag,
-                                                       msgTagOffset + offset * b, SecureOperator::NO_CLIENT_COMPUTE)
-                                   .execute()
-                                   ->_zis;
-
-                    return std::make_tuple(iB, jB, zs2);
-                }));
-            }
-
-            for (auto& fut : futures) {
-                auto [iB, jB, zs2] = fut.get();
-                int sz = static_cast<int>(iB.size());
-                for (int t = 0; t < sz; ++t) {
-                    secrets[iB[t]]._data = zs2[t];
-                    secrets[jB[t]]._data = zs2[t + sz];
-                }
-            }
-        }
-    }
-}
-
-void bitonicSortArith(std::vector<ArithSecret>& secrets, bool asc, int taskTag, int msgTagOffset) {
-    if (Conf::BATCH_SIZE <= 0 || Conf::DISABLE_MULTI_THREAD) {
-        bitonicSortArithSingleBatch(secrets, asc, taskTag, msgTagOffset);
-    } else {
-        bitonicSortArithSplittedBatches(secrets, asc, taskTag, msgTagOffset);
-    }
-}
-
-void doSort(std::vector<ArithSecret>& secrets, bool asc, int taskTag) {
-    size_t n = secrets.size();
-    bool isPowerOf2 = (n > 0) && ((n & (n - 1)) == 0);
-    size_t paddingCount = 0;
-    if (!isPowerOf2) {
-        ArithSecret p;
-        p._padding = true;
-
-        size_t nextPow2 = static_cast<size_t>(1) << static_cast<size_t>(std::ceil(std::log2(n)));
-        secrets.resize(nextPow2, p);
-        paddingCount = nextPow2 - n;
-    }
-    bitonicSortArith(secrets, asc, taskTag, 0);
-    if (paddingCount > 0) {
-        secrets.resize(secrets.size() - paddingCount);
-    }
-}
-
-void Secrets::sort(std::vector<ArithSecret>& secrets, bool asc, int taskTag) { doSort(secrets, asc, taskTag); }
 
 } // namespace parsecdb

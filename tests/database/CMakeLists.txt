@@ -1,5 +1,5 @@
-# Runs exp_1..exp_8 in --check=true mode over MPI and TCP and compares their output with the expected results in
-# verify_exp.py.
+# Runs exp_1..exp_8 in --check=true mode over MPI and TCP, and with background BMTs over MPI, and compares their output
+# with the expected results in verify_exp.py.
 find_package(Python3 COMPONENTS Interpreter)
 if (NOT Python3_Interpreter_FOUND)
     message(STATUS "Python 3 not found - database checks will not be registered")
@@ -22,4 +22,16 @@ foreach (exp RANGE 1 8)
     endif ()
     set_tests_properties(database.exp_${exp}.tcp PROPERTIES
             LABELS "correctness;database;tcp" PROCESSORS 3 TIMEOUT 180)
+
+    # The same check with BMTs from the background generator queues, which exercises the ordered BMT hand-off to
+    # parallel operators and the coordinated generator shutdown.
+    add_test(NAME database.exp_${exp}.mpi.background
+            COMMAND ${Python3_EXECUTABLE} ${PARSEC_VERIFY_EXP} --exp ${exp} --comm mpi
+                    --mpirun ${MPIEXEC_EXECUTABLE} "--mpirun-flags=${PARSEC_MPIEXEC_TEST_FLAGS}"
+                    --bmt-method bmt_background --max-bmts 10000 --bin-dir $<TARGET_FILE_DIR:exp_${exp}>)
+    set_tests_properties(database.exp_${exp}.mpi.background PROPERTIES
+            LABELS "correctness;database;mpi;background" PROCESSORS 3 TIMEOUT 180)
+    if (PARSEC_MPI_TEST_ENVIRONMENT)
+        set_property(TEST database.exp_${exp}.mpi.background PROPERTY ENVIRONMENT ${PARSEC_MPI_TEST_ENVIRONMENT})
+    endif ()
 endforeach ()

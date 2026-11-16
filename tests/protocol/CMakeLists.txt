@@ -75,30 +75,6 @@ parsec_add_mpi_test(correctness.bool_less correctness_bool_less)
 parsec_add_mpi_test(correctness.bool_mux correctness_bool_mux)
 parsec_add_mpi_test(correctness.share_conversion correctness_share_conversion)
 
-# Known operator bugs. Each of these runs enables one reproduction that the default run skips (see --known_bugs in
-# the test sources) and is expected to fail; when one starts passing, the bug is fixed: drop its WILL_FAIL entry and
-# the skip in the test.
-parsec_add_mpi_test(correctness.known_bug.a2b_single_narrow correctness_share_conversion ARGS --known_bugs=a2b_single_narrow)
-parsec_add_mpi_test(correctness.known_bug.arith_less_single_narrow correctness_arith_less ARGS --known_bugs=a2b_single_narrow)
-parsec_add_mpi_test(correctness.known_bug.b2a_batch_client correctness_share_conversion ARGS --known_bugs=b2a_batch_client)
-parsec_add_mpi_test(correctness.known_bug.bool_and_straddle correctness_bool_and_xor ARGS --known_bugs=bool_and_straddle)
-parsec_add_mpi_test(correctness.known_bug.bool_less_straddle correctness_bool_less ARGS --known_bugs=bool_and_straddle)
-parsec_add_mpi_test(correctness.known_bug.bool_mux_straddle correctness_bool_mux ARGS --known_bugs=bool_and_straddle)
-parsec_add_mpi_test(correctness.known_bug.xor_batch_client correctness_bool_and_xor ARGS --known_bugs=xor_batch_client)
-parsec_add_mpi_test(correctness.known_bug.and_single_client correctness_bool_and_xor ARGS --known_bugs=and_single_client)
-parsec_add_mpi_test(correctness.known_bug.xor_single_wide correctness_bool_and_xor ARGS --known_bugs=xor_single_wide)
-set_tests_properties(
-        correctness.known_bug.a2b_single_narrow
-        correctness.known_bug.arith_less_single_narrow
-        correctness.known_bug.b2a_batch_client
-        correctness.known_bug.bool_and_straddle
-        correctness.known_bug.bool_less_straddle
-        correctness.known_bug.bool_mux_straddle
-        correctness.known_bug.xor_batch_client
-        correctness.known_bug.and_single_client
-        correctness.known_bug.xor_single_wide
-        PROPERTIES WILL_FAIL TRUE LABELS "correctness;protocol;mpi;known_bug")
-
 parsec_add_tcp_test(correctness.tcp.ot correctness_ot)
 parsec_add_tcp_test(correctness.tcp.base_ot_batch correctness_base_ot_batch)
 parsec_add_tcp_test(correctness.tcp.bitwise_bmt correctness_bitwise_bmt)

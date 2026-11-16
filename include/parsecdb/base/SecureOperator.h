@@ -35,6 +35,9 @@ class SecureOperator {
     [[nodiscard]] int64_t ring(int64_t raw) const;
 
     [[nodiscard]] int buildTag(int msgTag) const;
+
+    // Arithmetic and Boolean operators support widths 1, 2, 4, ..., 64 only; throws std::invalid_argument otherwise.
+    static void requireSupportedWidth(int width);
 };
 
 } // namespace parsecdb

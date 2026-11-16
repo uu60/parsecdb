@@ -34,6 +34,8 @@ tests/database/verify_exp.py --exp all
 Optional argument:
 
 - `--comm=mpi|tcp` to select the communication backend. Default is `mpi`.
+- `--bmt-method=bmt_jit|bmt_fixed|bmt_background` to run the same checks with another BMT source. Background mode adds
+  `--disable_arith=false`; combine it with a bounded queue such as `--max-bmts=10000`.
 - `--mpirun=<cmd>` to specify MPI launcher command.
 - `--bin-dir=<dir>` to point at the directory containing `exp_N`. By default the script uses
   `$PARSEC_BUILD_DIR/experiments/database` when set, otherwise the first existing directory among `build/`,
