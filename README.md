@@ -102,8 +102,8 @@ include/parsecdb/        Public headers, included as "parsecdb/<module>/<Header>
   db/                                    secure relational tables, views, and operators
 src/<module>/            Implementation, one directory per header module
 tests/unit/              Single-process GoogleTest cases (label `unit`)
-tests/protocol/          Three-party protocol correctness over MPI and TCP (label `protocol`)
-tests/database/          Check mode of the database experiments (label `database`)
+tests/protocol/          Communication, OT, BMT, operator and container tests over MPI and TCP (label `protocol`)
+tests/database/          Database operators against plaintext (`db`) and exp_1..exp_8 checks (`query`)
 benchmarks/primitives/   MPC primitive and OT benchmarks, with helper scripts
 benchmarks/database/     Secure database operator benchmarks, with helper scripts
 experiments/database/    Research experiments exp_1 to exp_8

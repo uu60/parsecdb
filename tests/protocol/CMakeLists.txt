@@ -1,6 +1,6 @@
-# Three-party protocol correctness tests. Every program in this directory is built and registered with CTest over
-# MPI and, for most, over the TCP backend. A test passes when every rank exits with status 0 and no rank prints
-# FAIL or MISMATCH.
+# Three-party protocol correctness tests (layer: protocol). Every program in this directory is built and registered
+# with parsec_add_party_test (tests/CMakeLists.txt). A test passes when every rank exits with status 0 and no rank
+# prints FAIL or MISMATCH.
 file(GLOB PARSEC_PROTOCOL_TEST_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
 foreach (src ${PARSEC_PROTOCOL_TEST_SOURCES})
     get_filename_component(name ${src} NAME_WE)
@@ -8,84 +8,54 @@ foreach (src ${PARSEC_PROTOCOL_TEST_SOURCES})
     target_link_libraries(${name} PRIVATE parsecdb)
 endforeach ()
 
-function(parsec_add_mpi_test name target)
-    cmake_parse_arguments(PARSEC_TEST "SLOW" "" "ARGS" ${ARGN})
-    add_test(
-            NAME ${name}
-            COMMAND ${MPIEXEC_EXECUTABLE} ${PARSEC_MPIEXEC_TEST_FLAGS_LIST} ${MPIEXEC_NUMPROC_FLAG} 3
-                    ${MPIEXEC_PREFLAGS} $<TARGET_FILE:${target}>
-                    ${PARSEC_TEST_ARGS} ${MPIEXEC_POSTFLAGS})
-    set_tests_properties(${name} PROPERTIES
-            LABELS "correctness;protocol;mpi"
-            PROCESSORS 3
-            TIMEOUT 120
-            FAIL_REGULAR_EXPRESSION "FAIL;MISMATCH")
-    if (PARSEC_MPI_TEST_ENVIRONMENT)
-        set_property(TEST ${name} PROPERTY ENVIRONMENT ${PARSEC_MPI_TEST_ENVIRONMENT})
-    endif ()
-    if (PARSEC_TEST_SLOW)
-        set_property(TEST ${name} APPEND PROPERTY LABELS slow)
-        set_property(TEST ${name} PROPERTY TIMEOUT 300)
-    endif ()
+# Layers below the secure operators do not depend on the BMT source: one test per backend, no BMT suffix.
+# parsec_add_backend_tests(<group> <case> <target> [ARGS...])
+function(parsec_add_backend_tests group case target)
+    foreach (backend IN ITEMS mpi tcp)
+        parsec_add_party_test(NAME protocol.${group}.${case}.${backend} TARGET ${target} BACKEND ${backend}
+                LABELS protocol ${group} ARGS ${ARGN})
+    endforeach ()
 endfunction()
 
-find_package(Python3 COMPONENTS Interpreter)
-set(PARSEC_TCP_TEST_PORT 19000)
+# Comm layer: send/receive between every pair of ranks, plain and with transfer compression.
+parsec_add_party_test(NAME protocol.comm.send_receive.mpi TARGET correctness_comm BACKEND mpi LABELS protocol comm)
+parsec_add_party_test(NAME protocol.comm.send_receive.tcp TARGET correctness_comm BACKEND tcp LABELS protocol comm)
 
-# Runs the same three-rank test over the TCP backend as independent processes. Each test gets its own port
-# range so tests can run in parallel.
-function(parsec_add_tcp_test name target)
-    cmake_parse_arguments(PARSEC_TEST "SLOW" "" "ARGS" ${ARGN})
-    if (NOT Python3_Interpreter_FOUND)
-        return()
+# Oblivious transfer: base OT between the servers and the IKNP extension.
+parsec_add_backend_tests(ot base correctness_ot)
+parsec_add_backend_tests(ot iknp correctness_iknp_ot)
+
+# BMT generation: bitwise and arithmetic triples.
+parsec_add_backend_tests(bmt generation correctness_bmt)
+
+# Secure operators, with every BMT source over MPI and the default source over TCP.
+set(PARSEC_OPERATOR_VARIANTS mpi.jit mpi.fixed mpi.background tcp.jit)
+
+# parsec_add_operator_tests(<group> <case> <target> [SLOW] [ARGS <args...>] [VARIANTS <backend.bmt...>])
+function(parsec_add_operator_tests group case target)
+    cmake_parse_arguments(T "SLOW" "" "ARGS;VARIANTS" ${ARGN})
+    if (NOT T_VARIANTS)
+        set(T_VARIANTS ${PARSEC_OPERATOR_VARIANTS})
     endif ()
-    math(EXPR port "${PARSEC_TCP_TEST_PORT} + 10")
-    set(PARSEC_TCP_TEST_PORT ${port} PARENT_SCOPE)
-    add_test(
-            NAME ${name}
-            COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/run_tcp_ranks.py
-                    --base-port ${port} --timeout 100 $<TARGET_FILE:${target}> -- ${PARSEC_TEST_ARGS})
-    set_tests_properties(${name} PROPERTIES
-            LABELS "correctness;protocol;tcp"
-            PROCESSORS 3
-            TIMEOUT 120)
-    if (PARSEC_TEST_SLOW)
-        set_property(TEST ${name} APPEND PROPERTY LABELS slow)
+    set(extra "")
+    if (T_SLOW)
+        list(APPEND extra SLOW)
     endif ()
+    parsec_add_bmt_variants(NAME protocol.${group}.${case} TARGET ${target} LABELS protocol ${group}
+            VARIANTS ${T_VARIANTS} ARGS ${T_ARGS} ${extra})
 endfunction()
 
-parsec_add_mpi_test(correctness.ot correctness_ot)
-parsec_add_mpi_test(correctness.base_ot_batch correctness_base_ot_batch)
-parsec_add_mpi_test(correctness.bitwise_bmt correctness_bitwise_bmt)
-parsec_add_mpi_test(correctness.iknp_ot correctness_iknp_ot_simple)
-parsec_add_mpi_test(correctness.iknp_ot_bits correctness_iknp_ot_forbits_simple)
-parsec_add_mpi_test(correctness.iknp_ot_bits_both_directions correctness_iknp_ot_forbits_both_directions)
-parsec_add_mpi_test(correctness.bmt_ot_logic correctness_bmt_ot_logic)
-parsec_add_mpi_test(correctness.bool_equal correctness_bool_equal)
-parsec_add_mpi_test(correctness.bool_equal_fixed correctness_bool_equal ARGS --bmt_method=bmt_fixed)
-parsec_add_mpi_test(correctness.secret_sort_arith correctness_secrets_sort SLOW ARGS --test_mode=arith)
-parsec_add_mpi_test(correctness.secret_sort_bool correctness_secrets_sort SLOW ARGS --test_mode=bool)
-parsec_add_mpi_test(correctness.arith_add_multiply correctness_arith_add_multiply)
-parsec_add_mpi_test(correctness.arith_add_multiply_fixed correctness_arith_add_multiply ARGS --bmt_method=bmt_fixed)
-parsec_add_mpi_test(correctness.arith_less correctness_arith_less)
-parsec_add_mpi_test(correctness.arith_mux correctness_arith_mux)
-parsec_add_mpi_test(correctness.bool_and_xor correctness_bool_and_xor)
-parsec_add_mpi_test(correctness.bool_and_xor_fixed correctness_bool_and_xor ARGS --bmt_method=bmt_fixed)
-parsec_add_mpi_test(correctness.bool_less correctness_bool_less)
-parsec_add_mpi_test(correctness.bool_mux correctness_bool_mux)
-parsec_add_mpi_test(correctness.share_conversion correctness_share_conversion)
 
-parsec_add_tcp_test(correctness.tcp.ot correctness_ot)
-parsec_add_tcp_test(correctness.tcp.base_ot_batch correctness_base_ot_batch)
-parsec_add_tcp_test(correctness.tcp.bitwise_bmt correctness_bitwise_bmt)
-parsec_add_tcp_test(correctness.tcp.iknp_ot correctness_iknp_ot_simple)
-parsec_add_tcp_test(correctness.tcp.bmt_ot_logic correctness_bmt_ot_logic)
-parsec_add_tcp_test(correctness.tcp.bool_equal correctness_bool_equal)
-parsec_add_tcp_test(correctness.tcp.secret_sort_arith correctness_secrets_sort SLOW ARGS --test_mode=arith)
-parsec_add_tcp_test(correctness.tcp.arith_add_multiply correctness_arith_add_multiply)
-parsec_add_tcp_test(correctness.tcp.arith_less correctness_arith_less)
-parsec_add_tcp_test(correctness.tcp.arith_mux correctness_arith_mux)
-parsec_add_tcp_test(correctness.tcp.bool_and_xor correctness_bool_and_xor)
-parsec_add_tcp_test(correctness.tcp.bool_less correctness_bool_less)
-parsec_add_tcp_test(correctness.tcp.bool_mux correctness_bool_mux)
-parsec_add_tcp_test(correctness.tcp.share_conversion correctness_share_conversion)
+parsec_add_operator_tests(boolean and_xor correctness_bool_and_xor)
+parsec_add_operator_tests(boolean equal correctness_bool_equal)
+parsec_add_operator_tests(boolean less correctness_bool_less)
+parsec_add_operator_tests(boolean mux correctness_bool_mux)
+
+parsec_add_operator_tests(arithmetic add_multiply correctness_arith_add_multiply)
+parsec_add_operator_tests(arithmetic less correctness_arith_less)
+parsec_add_operator_tests(arithmetic mux correctness_arith_mux)
+
+parsec_add_operator_tests(conversion a2b_b2a correctness_share_conversion)
+
+parsec_add_operator_tests(secret sort_arith correctness_secrets_sort SLOW ARGS --test_mode=arith)
+parsec_add_operator_tests(secret sort_bool correctness_secrets_sort SLOW ARGS --test_mode=bool)

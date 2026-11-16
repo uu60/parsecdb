@@ -48,7 +48,7 @@
     },
     {
       "name": "ci-database",
-      "displayName": "CI database build and experiment checks",
+      "displayName": "CI database build, operator and query checks",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/ci-database",
       "cacheVariables": {
@@ -115,7 +115,7 @@
       },
       "filter": {
         "include": {
-          "label": "database"
+          "label": "^(db|query)$"
         }
       }
     },

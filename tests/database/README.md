@@ -10,11 +10,11 @@ cmake --preset dev
 cmake --build --preset dev
 ```
 
-When `PARSEC_BUILD_TESTS=ON`, these checks are also registered with CTest under the `database` label for both
-backends:
+When `PARSEC_BUILD_TESTS=ON`, these checks are also registered with CTest as `query.exp_<N>.<backend>.<bmt>` (label
+`query`), next to the database operator test `db.operators.*` (label `db`); see [docs/testing.md](../../docs/testing.md):
 
 ```bash
-ctest --preset dev -L database
+ctest --preset dev -L query
 ```
 
 ## Run

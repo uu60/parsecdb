@@ -42,6 +42,12 @@ Until 1.0.0, minor versions may contain breaking API changes.
 
 ### Added
 
+- A layered test suite named `<layer>.<group>.<case>.<backend>[.<bmt>]` with matching labels, described in
+  `docs/testing.md`: unit, communication (new), OT, BMT generation, Boolean and arithmetic operators, share conversion
+  and secret containers (each operator under JIT, fixed and background BMTs over MPI, and over TCP), database operators
+  (new: every `View`/`Views` operator against plaintext in four execution modes) and queries. Redundant OT and BMT
+  tests were merged; the arithmetic BMT generator is now tested directly.
+
 - `tools/verify.py`: builds everything and runs every correctness check (all tests, the experiments under the paper
   configurations, BMT modes, threading and batch sizes over MPI and TCP, the Figure 4 microbenchmarks, and optionally a
   sanitizer build), printing one `name ........ OK` line per check and a summary.
@@ -54,6 +60,13 @@ Until 1.0.0, minor versions may contain breaking API changes.
   background BMTs.
 
 ### Fixed
+- MPI transfer compression (`--enable_transfer_compression=true`) sent widths 9..16 through `int` buffers typed
+  `MPI_INT16_T`, garbling the data, and asynchronous compressed transfers freed their buffers twice.
+- Arithmetic less-than and equality refused background BMTs, and arithmetic mux ignored BMTs passed with `setBmts()`
+  (its two multiplications polled the queue themselves, concurrently with intra-operator parallelism). The arithmetic
+  `Secrets::sort` now hands every parallel batch BMTs polled in order, as the Boolean sort does.
+- `System::auxiliaryTask()` rejects task tags that would set the sign bit of the message tag, which MPI rejects, and
+  `Comm::wait()` reports an asynchronous transfer that failed to start instead of dereferencing a null request.
 - Grouped `max` over more rows than one batch wrote the new validity into the max column instead of `$valid`, and
   `count` after an outer join counted unmatched rows when the rows exceeded one batch. Both now behave like the
   single-batch path at every size; `tests/database/correctness_db_aggregates` checks them against plaintext.

@@ -1,23 +1,35 @@
 #!/usr/bin/env python3
 """End-to-end correctness verification for Parsec.
 
-Builds every target and runs, in order:
+Runs every correctness check, layer by layer from the bottom up, so that the first failing layer points at the cause:
 
-  1. build      configure and build all targets with warnings as errors
-  2. ctest      every registered test (unit, protocol over MPI and TCP, database checks, aggregates)
-  3. matrix     exp_1..exp_8 in check mode under the paper configurations, every BMT method, single-threaded and
-                small-batch execution, several background queues, and the TCP backend
-  4. figure4    the JIT and background microbenchmarks of Figure 4 on small inputs
-  5. sanitizers (with --sanitizers) unit and protocol tests in an AddressSanitizer/UBSan build
+   1. Build                  all targets, warnings as errors
+   2. Unit tests             single-process: crypto, math, SIMD, strings
+   3. Communication          point-to-point and server-to-server messaging over MPI and TCP
+   4. Oblivious transfer     base OT and IKNP OT extension
+   5. BMT generation         Beaver triples from OT
+   6. Boolean operators      XOR, AND, equality, less-than, mux              (JIT, fixed and background BMTs; TCP)
+   7. Arithmetic operators   add, multiply, less-than, mux                   (same variants)
+   8. Share conversion       A2B and B2A                                     (same variants)
+   9. Secret containers      ArithSecret/BoolSecret/BitSecret and Secrets::sort
+  10. Database operators     filters, sorts, grouping and aggregates, distinct, joins, IN, each against plaintext in
+                             four execution modes
+  11. Queries                exp_1..exp_8 in check mode: the registered runs, then the paper configurations
+                             (parsec, parsec_base, parsec_noncompact) and further BMT, threading and batch settings
+  12. Benchmarks             the Figure 4 JIT and background microbenchmarks on small inputs
+  13. Sanitizers             (with --sanitizers) layers 2-9 under AddressSanitizer and UBSan
 
-Each check prints one line, "name ........ OK" (or FAIL / SKIP), followed by a summary. Logs of failed checks are
-kept under <build-dir>/verify-logs. The exit code is 0 only when nothing failed.
+Layers 2-11 run the tests registered with CTest (named <layer>.<group>.<case>.<backend>[.<bmt>]); the extra query
+configurations and the benchmarks are run by this script. Each check prints one line, "name ........ OK" (or FAIL or
+SKIP); a summary follows, and logs of failed checks are kept under <build-dir>/verify-logs. The exit code is 0 only
+when nothing failed.
 
 Examples:
-  tools/verify.py                       # everything except sanitizers
-  tools/verify.py --quick               # ctest plus the paper configurations
-  tools/verify.py --skip-build --only matrix
-  CC=gcc CXX=g++ tools/verify.py --sanitizers --cmake-arg=-DCMAKE_PREFIX_PATH=/opt/gtest
+  tools/verify.py                         # everything except sanitizers, about 5 minutes on 12 cores
+  tools/verify.py --quick                 # registered tests only
+  tools/verify.py --sanitizers
+  tools/verify.py --skip-build --build-dir build/dev --only queries
+  CC=gcc CXX=g++ tools/verify.py --cmake-arg=-DCMAKE_PREFIX_PATH=/opt/googletest
 """
 import argparse
 import concurrent.futures
@@ -29,32 +41,44 @@ import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(REPO, "tests", "database"))
-import verify_exp  # noqa: E402  (expected results and output parsing of the experiment checks)
+import verify_exp  # noqa: E402  (expected results and output parsing of the query checks)
 
-WIDTH = 72
-STAGES = ["build", "ctest", "matrix", "figure4", "sanitizers"]
+WIDTH = 76
 
-# Name, extra experiment arguments. The first three are the configurations the paper evaluates
-# (artifact/experiments.yaml on the artifact branch).
-PAPER_CONFIGS = [
-    ("parsec", ["--baseline_mode=false", "--no_compaction=false", "--batch_size=256"]),
-    ("parsec_base", ["--baseline_mode=true", "--no_compaction=true", "--batch_size=0"]),
-    ("parsec_noncompact", ["--baseline_mode=false", "--no_compaction=true", "--batch_size=256"]),
+# Sections in dependency order: (key for --only, title, prefix of the CTest names it contains).
+LAYERS = [
+    ("unit", "Unit tests", "unit."),
+    ("comm", "Communication", "protocol.comm."),
+    ("ot", "Oblivious transfer", "protocol.ot."),
+    ("bmt", "BMT generation", "protocol.bmt."),
+    ("boolean", "Boolean operators", "protocol.boolean."),
+    ("arithmetic", "Arithmetic operators", "protocol.arithmetic."),
+    ("conversion", "Share conversion", "protocol.conversion."),
+    ("secret", "Secret containers and sorting", "protocol.secret."),
+    ("db", "Database operators", "db."),
+    ("queries", "Queries (exp_1..exp_8)", "query."),
 ]
+STAGES = ["build"] + [key for key, _, _ in LAYERS] + ["benchmarks", "sanitizers"]
+
+# Query configurations beyond the registered runs (which cover JIT and background BMTs over MPI and JIT over TCP).
+# The first three are the configurations the paper evaluates (artifact/experiments.yaml on the artifact branch).
 BACKGROUND = ["--bmt_method=bmt_background", "--disable_arith=false", "--max_bmts=10000"]
-EXTRA_CONFIGS = [
-    ("bmt_fixed", ["--bmt_method=bmt_fixed"]),
-    ("bmt_background", BACKGROUND),
-    ("bmt_background single-thread", BACKGROUND + ["--disable_multi_thread=true"]),
-    ("bmt_background 2 queues", BACKGROUND + ["--bmt_queue_num=2"]),
-    ("single-thread", ["--disable_multi_thread=true"]),
-    ("one batch", ["--batch_size=0"]),
-    ("batch size 1", ["--batch_size=1"]),
-    ("batch size 4", ["--batch_size=4"]),
+QUERY_CONFIGS = [
+    ("parsec", "mpi", ["--baseline_mode=false", "--no_compaction=false", "--batch_size=256"]),
+    ("parsec_base", "mpi", ["--baseline_mode=true", "--no_compaction=true", "--batch_size=0"]),
+    ("parsec_noncompact", "mpi", ["--baseline_mode=false", "--no_compaction=true", "--batch_size=256"]),
+    ("fixed", "mpi", ["--bmt_method=bmt_fixed"]),
+    ("background, single-thread", "mpi", BACKGROUND + ["--disable_multi_thread=true"]),
+    ("background, 2 queues", "mpi", BACKGROUND + ["--bmt_queue_num=2"]),
+    ("single-thread", "mpi", ["--disable_multi_thread=true"]),
+    ("one batch", "mpi", ["--batch_size=0"]),
+    ("batch size 1", "mpi", ["--batch_size=1"]),
+    ("batch size 4", "mpi", ["--batch_size=4"]),
+    ("background", "tcp", BACKGROUND),
 ]
 FIGURE4_PRIMITIVES = [("!=", "not equal"), ("<", "less"), ("==", "equal"), ("mux", "mux"), ("sort", "sort")]
 
@@ -63,7 +87,8 @@ class Reporter:
     def __init__(self, log_dir: str, color: bool):
         self.log_dir = log_dir
         self.color = color
-        self.results: List[Tuple[str, str, str]] = []  # (name, status, log path)
+        self.results: List[Tuple[str, str, str, str]] = []  # (section, name, status, log path)
+        self.section_name = ""
 
     def _paint(self, status: str) -> str:
         if not self.color:
@@ -71,35 +96,45 @@ class Reporter:
         code = {"OK": "32", "FAIL": "31", "SKIP": "33"}.get(status, "0")
         return f"\033[{code}m{status}\033[0m"
 
-    def section(self, title: str) -> None:
-        print(f"\n== {title}", flush=True)
+    def section(self, number: int, title: str) -> None:
+        self.section_name = title
+        print(f"\n[{number:2d}] {title}", flush=True)
 
     def record(self, name: str, status: str, output: str = "", seconds: Optional[float] = None) -> None:
         log = ""
         if status == "FAIL" and output:
             os.makedirs(self.log_dir, exist_ok=True)
-            log = os.path.join(self.log_dir, re.sub(r"[^A-Za-z0-9_.-]+", "_", name) + ".log")
+            log = os.path.join(self.log_dir, re.sub(r"[^A-Za-z0-9_.-]+", "_", f"{self.section_name}-{name}") + ".log")
             with open(log, "w") as f:
                 f.write(output)
-        self.results.append((name, status, log))
+        self.results.append((self.section_name, name, status, log))
         timing = f" ({seconds:.1f}s)" if seconds is not None and seconds >= 1 else ""
-        dots = "." * max(3, WIDTH - len(name) - len(timing))
-        print(f"{name}{timing} {dots} {self._paint(status)}", flush=True)
+        label = f"     {name}{timing} "
+        print(f"{label}{'.' * max(3, WIDTH - len(label))} {self._paint(status)}", flush=True)
 
     def summary(self) -> int:
-        counts = {s: sum(1 for _, st, _ in self.results if st == s) for s in ("OK", "FAIL", "SKIP")}
+        print("\nSummary")
+        sections: Dict[str, List[str]] = {}
+        for section, _, status, _ in self.results:
+            sections.setdefault(section, []).append(status)
+        for section, statuses in sections.items():
+            ok, fail, skip = (statuses.count(s) for s in ("OK", "FAIL", "SKIP"))
+            state = "FAIL" if fail else ("SKIP" if ok == 0 else "OK")
+            detail = f"{ok}/{len(statuses)}" + (f", {skip} skipped" if skip else "")
+            label = f"     {section} ({detail}) "
+            print(f"{label}{'.' * max(3, WIDTH - len(label))} {self._paint(state)}")
+        counts = {s: sum(1 for r in self.results if r[2] == s) for s in ("OK", "FAIL", "SKIP")}
         print(f"\n{counts['OK']} OK, {counts['FAIL']} FAIL, {counts['SKIP']} SKIP")
-        for name, status, log in self.results:
+        for section, name, status, log in self.results:
             if status == "FAIL":
-                print(f"  FAIL {name}" + (f"  -> {log}" if log else ""))
+                print(f"  FAIL {section}: {name}" + (f"\n       log: {log}" if log else ""))
         return 1 if counts["FAIL"] else 0
 
 
-def run(cmd: Sequence[str], timeout: float, cwd: Optional[str] = None,
-        env: Optional[dict] = None) -> Tuple[int, str, float]:
+def run(cmd: Sequence[str], timeout: float, env: Optional[dict] = None) -> Tuple[int, str, float]:
     start = time.time()
     try:
-        p = subprocess.run(list(cmd), cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        p = subprocess.run(list(cmd), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                            timeout=timeout)
         return p.returncode, p.stdout, time.time() - start
     except subprocess.TimeoutExpired as e:
@@ -108,90 +143,86 @@ def run(cmd: Sequence[str], timeout: float, cwd: Optional[str] = None,
 
 
 def mpirun_command(args: argparse.Namespace) -> List[str]:
-    flags = shlex.split(args.mpirun_flags) if args.mpirun_flags is not None else []
-    if args.mpirun_flags is None:
-        _, version, _ = run([args.mpirun, "--version"], 30)
-        if "Open MPI" in version or "OpenRTE" in version:
-            flags = ["--oversubscribe"]
+    if args.mpirun_flags is not None:
+        return [args.mpirun, *shlex.split(args.mpirun_flags), "-np", "3"]
+    _, version, _ = run([args.mpirun, "--version"], 30)
+    flags = ["--oversubscribe"] if ("Open MPI" in version or "OpenRTE" in version) else []
     return [args.mpirun, *flags, "-np", "3"]
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# Stages
+# Build and CTest
 
 
-def stage_build(args, rep: Reporter, build_dir: str, extra_cmake: List[str], name: str = "build") -> bool:
-    configure = ["cmake", "-S", REPO, "-B", build_dir, "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release",
-                 "-DPARSEC_BUILD_DATABASE=ON", "-DPARSEC_BUILD_BENCHMARKS=ON", "-DPARSEC_BUILD_EXPERIMENTS=ON",
-                 "-DPARSEC_BUILD_TESTS=ON", "-DPARSEC_WARNINGS_AS_ERRORS=ON", *args.cmake_arg, *extra_cmake]
-    code, out, secs = run(configure, 600)
+def configure_and_build(args, rep: Reporter, build_dir: str, cmake_args: List[str]) -> bool:
+    code, out, secs = run(["cmake", "-S", REPO, "-B", build_dir, "-G", "Ninja", *cmake_args, *args.cmake_arg], 600)
+    rep.record("configure", "OK" if code == 0 else "FAIL", out, secs)
     if code != 0:
-        rep.record(f"{name}: configure", "FAIL", out, secs)
         return False
-    rep.record(f"{name}: configure", "OK", seconds=secs)
     if "GoogleTest not found" in out:
-        rep.record(f"{name}: GoogleTest found (unit tests)", "SKIP")
-    code, out2, secs = run(["cmake", "--build", build_dir, "--parallel", str(args.build_jobs)], 3600)
-    rep.record(f"{name}: compile all targets", "OK" if code == 0 else "FAIL", out2, secs)
+        rep.record("GoogleTest (unit tests are skipped without it)", "SKIP")
+    code, out, secs = run(["cmake", "--build", build_dir, "--parallel", str(args.build_jobs)], 3600)
+    rep.record("compile all targets", "OK" if code == 0 else "FAIL", out, secs)
     return code == 0
 
 
-def display_test_name(test: str) -> str:
-    """unit.Crypto.X -> 'unit  Crypto.X'; correctness.tcp.bool_less -> 'protocol  bool_less [tcp]'; ..."""
-    if test.startswith("unit."):
-        return "unit  " + test[len("unit."):]
-    if test.startswith("database."):
-        parts = test.split(".")[1:]
-        return "database  " + parts[0] + (" [" + ", ".join(parts[1:]) + "]" if len(parts) > 1 else "")
-    if test.startswith("correctness."):
-        rest = test[len("correctness."):]
-        backend = "mpi"
-        if rest.startswith("tcp."):
-            backend, rest = "tcp", rest[len("tcp."):]
-        return f"protocol  {rest.replace('_', ' ')} [{backend}]"
-    return test
-
-
-def stage_ctest(args, rep: Reporter, build_dir: str, prefix: str = "", labels: Optional[str] = None,
-                env: Optional[dict] = None) -> None:
+def run_ctest(args, build_dir: str, env: Optional[dict] = None) -> Tuple[Dict[str, Tuple[str, str, float]], str]:
+    """Runs every registered test once; returns name -> (status, output, seconds)."""
     junit = os.path.join(build_dir, "verify-ctest.xml")
-    cmd = ["ctest", "--test-dir", build_dir, "-j", str(args.jobs), "--output-junit", junit, "--timeout", "600"]
-    if labels:
-        cmd += ["-L", labels]
-    code, out, _ = run(cmd, 7200, env=env)
-    if not os.path.exists(junit):
-        rep.record(f"{prefix}ctest", "FAIL", out)
-        return
-    group = {"unit": 0, "protocol": 1, "database": 2}
-    cases = list(ET.parse(junit).getroot().iter("testcase"))
-    cases.sort(key=lambda c: (group.get(display_test_name(c.get("name", "")).split()[0], 3),
-                              display_test_name(c.get("name", ""))))
-    for case in cases:
-        name = case.get("name", "?")
-        status = "OK"
-        if case.find("failure") is not None or case.get("status") == "fail":
-            status = "FAIL"
-        elif case.find("skipped") is not None or case.get("status") in ("notrun", "disabled"):
-            status = "SKIP"
-        output = "".join(case.find("system-out").itertext()) if case.find("system-out") is not None else ""
-        rep.record(prefix + display_test_name(name), status, output, float(case.get("time", "0") or 0))
-    os.remove(junit)
+    if os.path.exists(junit):
+        os.remove(junit)
+    _, out, _ = run(["ctest", "--test-dir", build_dir, "-j", str(args.jobs), "--output-junit", junit,
+                     "--timeout", "900"], 7200, env=env)
+    results: Dict[str, Tuple[str, str, float]] = {}
+    if os.path.exists(junit):
+        for case in ET.parse(junit).getroot().iter("testcase"):
+            status = "OK"
+            if case.find("failure") is not None or case.get("status") == "fail":
+                status = "FAIL"
+            elif case.find("skipped") is not None or case.get("status") in ("notrun", "disabled"):
+                status = "SKIP"
+            sysout = case.find("system-out")
+            output = "".join(sysout.itertext()) if sysout is not None else ""
+            results[case.get("name", "?")] = (status, output, float(case.get("time", "0") or 0))
+        os.remove(junit)
+    return results, out
 
 
-def check_experiment(args, exp_dir: str, exp: int, extra: List[str], comm: str) -> Tuple[str, str, float]:
+def display_name(test: str, prefix: str) -> str:
+    """protocol.boolean.and_xor.mpi.background -> 'and_xor [mpi, background]'; unit.Suite.Case stays Suite.Case."""
+    rest = test[len(prefix):]
+    if prefix == "unit.":
+        return rest
+    parts = rest.split(".")
+    variants = [p for p in parts[1:]]
+    return parts[0].replace("_", " ") + (f" [{', '.join(variants)}]" if variants else "")
+
+
+def report_layer(rep: Reporter, results: Dict[str, Tuple[str, str, float]], prefix: str) -> int:
+    names = sorted(n for n in results if n.startswith(prefix))
+    for name in names:
+        status, output, secs = results[name]
+        rep.record(display_name(name, prefix), status, output, secs)
+    return len(names)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Query configurations and benchmarks
+
+
+def check_query(args, exp_dir: str, exp: int, extra: List[str], comm: str) -> Tuple[str, str, float]:
     exe = os.path.join(exp_dir, f"exp_{exp}")
-    if comm == "mpi":
-        code, out, secs = run([*mpirun_command(args), exe, "--check=true", *extra], args.timeout)
-    else:
-        # verify_exp.py starts the three TCP ranks; it accepts only the BMT method.
+    if comm == "tcp":
+        # verify_exp.py starts the three TCP ranks; it takes the BMT method only.
         method = next((a.split("=", 1)[1] for a in extra if a.startswith("--bmt_method=")), "bmt_jit")
         cmd = [sys.executable, os.path.join(REPO, "tests", "database", "verify_exp.py"), "--exp", str(exp),
                "--comm", "tcp", "--bin-dir", exp_dir, "--bmt-method", method,
-               "--tcp-base-port", str(23000 + 100 * exp), "--timeout", str(args.timeout)]
+               "--tcp-base-port", str(26000 + 100 * exp), "--timeout", str(args.timeout)]
         if method == "bmt_background":
             cmd += ["--max-bmts", "10000"]
         code, out, secs = run(cmd, args.timeout * 2)
         return ("OK" if code == 0 and "PASS" in out else "FAIL"), out, secs
+    code, out, secs = run([*mpirun_command(args), exe, "--check=true", *extra], args.timeout)
     if code != 0:
         return "FAIL", out + f"\n[verify] exit code {code}\n", secs
     try:
@@ -204,29 +235,20 @@ def check_experiment(args, exp_dir: str, exp: int, extra: List[str], comm: str) 
     return ("OK" if ok else "FAIL"), out, secs
 
 
-def stage_matrix(args, rep: Reporter, build_dir: str) -> None:
+def run_query_configs(args, rep: Reporter, build_dir: str) -> None:
     exp_dir = os.path.join(build_dir, "experiments", "database")
-    configs = PAPER_CONFIGS if args.quick else PAPER_CONFIGS + EXTRA_CONFIGS
-    jobs: List[Tuple[str, Callable[[], Tuple[str, str, float]]]] = []
-    for cname, extra in configs:
-        for exp in range(1, 9):
-            jobs.append((f"exp_{exp}  {cname} [mpi]",
-                         lambda e=exp, x=extra: check_experiment(args, exp_dir, e, x, "mpi")))
-    if not args.quick:
-        for cname, extra in [("bmt_jit", []), ("bmt_background", BACKGROUND)]:
-            for exp in range(1, 9):
-                jobs.append((f"exp_{exp}  {cname} [tcp]",
-                             lambda e=exp, x=extra: check_experiment(args, exp_dir, e, x, "tcp")))
-    # Each check starts three processes; run a few at a time and report in the original order.
-    workers = max(1, args.jobs // 2)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [(name, pool.submit(fn)) for name, fn in jobs]
-        for name, fut in futures:
+    jobs = [(f"exp_{exp} [{comm}, {name}]", exp, extra, comm)
+            for name, comm, extra in QUERY_CONFIGS for exp in range(1, 9)]
+    # Each run starts three processes; run a few at a time and report in order.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs // 2)) as pool:
+        futures = [(label, pool.submit(check_query, args, exp_dir, exp, extra, comm))
+                   for label, exp, extra, comm in jobs]
+        for label, fut in futures:
             status, out, secs = fut.result()
-            rep.record(name, status, out, secs)
+            rep.record(label, status, out, secs)
 
 
-def stage_figure4(args, rep: Reporter, build_dir: str) -> None:
+def run_benchmarks(args, rep: Reporter, build_dir: str) -> None:
     bench_dir = os.path.join(build_dir, "benchmarks", "primitives")
     for prim, label in FIGURE4_PRIMITIVES:
         num = 2000 if prim == "sort" else 20000
@@ -235,37 +257,23 @@ def stage_figure4(args, rep: Reporter, build_dir: str) -> None:
             code, out, secs = run([*mpirun_command(args), exe, f"--primitive={prim}", f"--num={num}", "--width=64",
                                    "--batch_size=256"], args.timeout * 2)
             ok = code == 0 and "RESULT:" in out and "Test failed" not in out
-            rep.record(f"figure4  {label} [{kind}]", "OK" if ok else "FAIL", out, secs)
+            rep.record(f"figure 4: {label} [{kind}]", "OK" if ok else "FAIL", out, secs)
 
 
-def stage_sanitizers(args, rep: Reporter) -> None:
-    san_dir = os.path.join(args.build_dir + "-sanitizers")
-    configure = ["cmake", "-S", REPO, "-B", san_dir, "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Debug",
-                 "-DPARSEC_ENABLE_SANITIZERS=ON", "-DPARSEC_BUILD_DATABASE=OFF", "-DPARSEC_BUILD_BENCHMARKS=OFF",
-                 "-DPARSEC_BUILD_EXPERIMENTS=OFF", "-DPARSEC_BUILD_TESTS=ON", "-DPARSEC_WARNINGS_AS_ERRORS=ON",
-                 *args.cmake_arg]
-    code, out, secs = run(configure, 600)
-    if code != 0:
-        rep.record("sanitizers: configure", "FAIL", out, secs)
-        return
-    code, out, secs = run(["cmake", "--build", san_dir, "--parallel", str(args.build_jobs)], 3600)
-    rep.record("sanitizers: compile", "OK" if code == 0 else "FAIL", out, secs)
-    if code != 0:
-        return
-    env = dict(os.environ, ASAN_OPTIONS="detect_leaks=0", UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1")
-    stage_ctest(args, rep, san_dir, prefix="asan  ", env=env)
+# ---------------------------------------------------------------------------------------------------------------------
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--build-dir", default=os.path.join(REPO, "build", "verify"))
     ap.add_argument("--skip-build", action="store_true", help="reuse an existing build in --build-dir")
-    ap.add_argument("--quick", action="store_true", help="ctest plus the paper configurations only")
-    ap.add_argument("--sanitizers", action="store_true", help="also run unit and protocol tests under ASan/UBSan")
-    ap.add_argument("--only", choices=STAGES, action="append", help="run only these stages (repeatable)")
+    ap.add_argument("--quick", action="store_true", help="registered tests only (no extra query configurations, "
+                                                         "no benchmarks)")
+    ap.add_argument("--sanitizers", action="store_true", help="also run layers 2-9 under ASan/UBSan")
+    ap.add_argument("--only", choices=STAGES, action="append", help="run only these sections (repeatable)")
     ap.add_argument("--jobs", type=int, default=4, help="parallel test jobs (default 4)")
     ap.add_argument("--build-jobs", type=int, default=os.cpu_count() or 4)
-    ap.add_argument("--timeout", type=float, default=180, help="seconds per experiment run")
+    ap.add_argument("--timeout", type=float, default=180, help="seconds per query run")
     ap.add_argument("--mpirun", default="mpirun")
     ap.add_argument("--mpirun-flags", default=None, help="launcher flags; default --oversubscribe for Open MPI")
     ap.add_argument("--cmake-arg", action="append", default=[], help="extra CMake argument (repeatable)")
@@ -273,35 +281,88 @@ def main() -> int:
     args = ap.parse_args()
     args.build_dir = os.path.abspath(args.build_dir)
 
-    stages = args.only or [s for s in STAGES if s != "sanitizers" or args.sanitizers]
-    if args.skip_build and "build" in stages:
-        stages.remove("build")
-    for tool in ("cmake", "ninja", args.mpirun):
+    selected = set(args.only or STAGES)
+    if not args.sanitizers and not args.only:
+        selected.discard("sanitizers")
+    if args.skip_build:
+        selected.discard("build")
+    if args.quick:
+        selected.discard("benchmarks")
+    for tool in ("cmake", "ninja", "ctest", args.mpirun):
         if shutil.which(tool) is None:
             print(f"required tool not found: {tool}")
             return 2
 
     rep = Reporter(os.path.join(args.build_dir, "verify-logs"), sys.stdout.isatty() and not args.no_color)
     shutil.rmtree(rep.log_dir, ignore_errors=True)
-    print(f"Parsec verification  (build dir: {args.build_dir})")
+    print(f"Parsec verification (build directory {args.build_dir})")
     start = time.time()
+    number = 0
 
-    if "build" in stages:
-        rep.section("Build")
-        if not stage_build(args, rep, args.build_dir, []):
+    def section(title: str) -> None:
+        nonlocal number
+        number += 1
+        rep.section(number, title)
+
+    if "build" in selected:
+        section("Build")
+        ok = configure_and_build(args, rep, args.build_dir, [
+            "-DCMAKE_BUILD_TYPE=Release", "-DPARSEC_BUILD_DATABASE=ON", "-DPARSEC_BUILD_BENCHMARKS=ON",
+            "-DPARSEC_BUILD_EXPERIMENTS=ON", "-DPARSEC_BUILD_TESTS=ON", "-DPARSEC_WARNINGS_AS_ERRORS=ON"])
+        if not ok:
             return rep.summary()
-    if "ctest" in stages:
-        rep.section("Registered tests (unit, protocol, database)")
-        stage_ctest(args, rep, args.build_dir)
-    if "matrix" in stages:
-        rep.section("Experiment checks across configurations")
-        stage_matrix(args, rep, args.build_dir)
-    if "figure4" in stages and not args.quick:
-        rep.section("Figure 4 microbenchmarks (JIT vs background)")
-        stage_figure4(args, rep, args.build_dir)
-    if "sanitizers" in stages:
-        rep.section("AddressSanitizer / UBSan")
-        stage_sanitizers(args, rep)
+    else:
+        number += 1
+
+    layer_keys = [key for key, _, _ in LAYERS]
+    if selected & set(layer_keys):
+        print("\nRunning the registered tests ...", flush=True)
+        results, ctest_out = run_ctest(args, args.build_dir)
+        if not results:
+            section("Registered tests")
+            rep.record("ctest", "FAIL", ctest_out)
+        for key, title, prefix in LAYERS:
+            if key not in selected:
+                number += 1
+                continue
+            section(title)
+            count = report_layer(rep, results, prefix)
+            if key == "queries" and not args.quick:
+                run_query_configs(args, rep, args.build_dir)
+            elif count == 0:
+                rep.record("no tests registered", "SKIP")
+        # Tests whose names fit no layer would otherwise go unreported.
+        prefixes = tuple(prefix for _, _, prefix in LAYERS)
+        stray = sorted(n for n in results if not n.startswith(prefixes))
+        if stray and not args.only:
+            rep.section(0, "Other registered tests")
+            for name in stray:
+                status, output, secs = results[name]
+                rep.record(name, status, output, secs)
+    else:
+        number += len(LAYERS)
+
+    if "benchmarks" in selected:
+        section("Benchmarks (smoke runs)")
+        run_benchmarks(args, rep, args.build_dir)
+    else:
+        number += 1
+
+    if "sanitizers" in selected:
+        section("Sanitizers (ASan/UBSan, layers 2-9)")
+        san_dir = args.build_dir + "-sanitizers"
+        if configure_and_build(args, rep, san_dir, [
+                "-DCMAKE_BUILD_TYPE=Debug", "-DPARSEC_ENABLE_SANITIZERS=ON", "-DPARSEC_BUILD_DATABASE=OFF",
+                "-DPARSEC_BUILD_BENCHMARKS=OFF", "-DPARSEC_BUILD_EXPERIMENTS=OFF", "-DPARSEC_BUILD_TESTS=ON",
+                "-DPARSEC_WARNINGS_AS_ERRORS=ON"]):
+            env = dict(os.environ, ASAN_OPTIONS="detect_leaks=0", UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1")
+            results, ctest_out = run_ctest(args, san_dir, env=env)
+            if not results:
+                rep.record("ctest", "FAIL", ctest_out)
+            for _, title, prefix in LAYERS:
+                for name in sorted(n for n in results if n.startswith(prefix)):
+                    status, output, secs = results[name]
+                    rep.record(f"{title.lower()}: {display_name(name, prefix)}", status, output, secs)
 
     code = rep.summary()
     print(f"total time {time.time() - start:.0f}s")
